@@ -2331,6 +2331,7 @@ it('re-surfaces the disclosure set once after compaction instead of editing ever
   const context: Record<string, any> = {
     recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
     mcpContentToPi: (content: unknown) => content,
+    createHash,
   };
   runInNewContext(compiled, context);
   const handlers = new Map<string, (event: any) => any>();
@@ -2343,8 +2344,13 @@ it('re-surfaces the disclosure set once after compaction instead of editing ever
   expect(handlers.get('before_agent_start')!({ systemPrompt: 'base' })).toBeUndefined();
 
   // A successful compaction arms exactly one reminder with the current keys.
-  gateway.disclosedSchemas.set('cindy_memory\u0000call_tool', 'fp-a');
-  gateway.disclosedSchemas.set('cindy_orca\u0000send_to_worker', 'fp-b');
+  const client = { request: async () => ({ content: [] }) };
+  const callTool = { name: 'call_tool', description: 'd', inputSchema: { type: 'object' } };
+  const sendWorker = { name: 'send_to_worker', description: 'd', inputSchema: { type: 'object' } };
+  gateway.add('cindy_memory', client, [callTool]);
+  gateway.add('cindy_orca', client, [sendWorker]);
+  gateway.disclosedSchemas.set('cindy_memory\u0000call_tool', gateway.schemaFingerprint(callTool));
+  gateway.disclosedSchemas.set('cindy_orca\u0000send_to_worker', gateway.schemaFingerprint(sendWorker));
   handlers.get('session_compact')!({ reason: 'threshold' });
   const note = handlers.get('before_agent_start')!({ systemPrompt: 'base' });
   expect(note?.message?.customType).toBe('cindy-mcp-disclosure-state');
@@ -2355,6 +2361,17 @@ it('re-surfaces the disclosure set once after compaction instead of editing ever
   expect(text).toContain('do not re-run cindy_mcp_list_tools');
   // One-shot: the second run after the same compaction stays clean.
   expect(handlers.get('before_agent_start')!({ systemPrompt: 'base' })).toBeUndefined();
+
+  // A removed tool or a drifted schema must not be advertised as safe to call:
+  // only keys whose tool still exists with a matching fingerprint are listed.
+  gateway.disclosedSchemas.set('cindy_ghosts\u0000gone_tool', gateway.schemaFingerprint(callTool));
+  gateway.disclosedSchemas.set('cindy_memory\u0000call_tool', 'stale-fingerprint');
+  handlers.get('session_compact')!({ reason: 'manual' });
+  const filtered = handlers.get('before_agent_start')!({ systemPrompt: 'base' });
+  const filteredText = filtered?.message?.content?.[0]?.text ?? '';
+  expect(filteredText).toContain('cindy_orca/send_to_worker');
+  expect(filteredText).not.toContain('gone_tool');
+  expect(filteredText).not.toContain('cindy_memory/call_tool');
 
   // An empty disclosure set consumes the flag without emitting an empty note.
   gateway.disclosedSchemas.clear();

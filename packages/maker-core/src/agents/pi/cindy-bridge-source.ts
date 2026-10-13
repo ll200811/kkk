@@ -3236,13 +3236,22 @@ class CindyMcpGateway {
     return this.disclosedSchemas.get(key) === this.schemaFingerprint(call.tool);
   }
 
-  /** Sorted, prompt-ready server/tool names of the persisted disclosure set. */
+  /**
+   * Sorted, prompt-ready server/tool names worth re-surfacing after compaction:
+   * only tools that still exist AND whose stored fingerprint still matches the
+   * live schema — a removed or schema-drifted tool must not be advertised as
+   * safe to call directly (the gate would re-close on it and waste a round-trip).
+   */
   disclosedKeysForPrompt(limit = 48): string {
-    const all = Array.from(this.disclosedSchemas.keys()).sort();
-    const shown = all.slice(0, limit).map((key) => {
+    const all: string[] = [];
+    for (const [key, fingerprint] of this.disclosedSchemas) {
+      const tool = this.tools.get(key);
+      if (!tool || this.schemaFingerprint(tool) !== fingerprint) continue;
       const sep = key.indexOf('\u0000');
-      return sep === -1 ? key : key.slice(0, sep) + '/' + key.slice(sep + 1);
-    });
+      all.push(sep === -1 ? key : key.slice(0, sep) + '/' + key.slice(sep + 1));
+    }
+    all.sort();
+    const shown = all.slice(0, limit);
     if (all.length > limit) shown.push('… +' + (all.length - limit) + ' more');
     return shown.join(', ');
   }
