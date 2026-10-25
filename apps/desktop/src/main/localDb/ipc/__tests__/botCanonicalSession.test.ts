@@ -18,6 +18,7 @@ import { authorizeSessionQueueItem, createSessionControlService, rebuildSessionQ
 import type { AgentInputQueuedMessage } from '../../../../shared/agentInputQueue';
 import type { ProviderView } from '@cindy/model-providers';
 import { createHash } from 'node:crypto';
+import { createCompanionCloudHost } from '../../../companion-cloud/host';
 import { join, resolve } from 'node:path';
 import { existsSync, mkdirSync, promises as fsPromises, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
@@ -246,6 +247,8 @@ import {
   ensureBotChannelLaneSession,
   findBotChannelLaneSession,
   registerBotIpc,
+  createBotProfile,
+  setBotProfileAvatar,
   updateBotProfile as updateStoredBotProfile,
   getBotRemoteResourceSource,
   listBotRemoteResourceSources,
@@ -979,6 +982,28 @@ describe('Bot canonical Session lifecycle', () => {
       expect(stored().invitation).toMatchObject({ id: 'invite-1', stage: 'ready' });
     });
 
+    // #6897 + #7116: the host must pass both trusted restore flags. The separate database
+    // tests bypass that adapter. A pending meeting plus a nonportable cloud avatar is the
+    // minimal combined input; use this existing SQLite integration fixture and no network.
+    it('takes over an unfinished meeting without losing the fallback avatar provenance', async () => {
+      unfinished('avatar');
+      const host = createCompanionCloudHost({
+        deliverToCanonical: async () => ({ ok: true }),
+        ensureCanonicalSession: async () => 'unused',
+        rebuildContext: async () => 'rebuilt',
+        listDevices: async () => [],
+      });
+      await host.materializer!.updateProfile({ id: 'bot-1', name: 'Cloud companion',
+        avatar: 'http://old-device.example/avatar.png' }, { assertCurrent() {} });
+      const profile = await invoke('local-db:bots:get', 'bot-1');
+      expect(profile).toMatchObject({ name: 'Cloud companion', avatar: '🤖' });
+      expect(stored().invitation).toBeUndefined();
+      expect(stored().cloudAvatarFallback).toBe(true);
+      await expect(invoke('local-db:bots:create-canonical-session', {
+        botId: 'bot-1', expectedCanonicalSessionId: null, expectedProfileVersion: profile.currentVersion,
+      })).resolves.toMatchObject({ created: true });
+    });
+
     it('does not let a renderer or model body switch the protection off', async () => {
       unfinished('skills');
       await expect(invoke('local-db:bots:update', { id: 'bot-1', name: 'Cindy', replacesUnfinishedMeeting: true }))
@@ -1415,6 +1440,37 @@ describe('Bot canonical Session lifecycle', () => {
       await expect(prepareImportedBotInvitation('archived-native', 'native-request')).rejects.toThrow('[NOT_FOUND]');
       expect(queued).not.toHaveBeenCalled();
     } finally { queued.mockRestore(); }
+  });
+
+  // #6897 (existing SQLite integration fixture): sync bookkeeping cannot be the only guard against
+  // publishing a fallback. Existing avatar tests never persisted this provenance.
+  it('persists cloud fallback provenance with the avatar and only releases it for a real image', async () => {
+    const created = await createBotProfile({ name: 'Restored fallback', avatar: '🤖' }, { avatarFallback: true });
+    const readProvenance = (botId = created.id) => {
+      const row = h.sqlite!.prepare(`SELECT v.capabilities_json AS json FROM bot_profiles p
+        JOIN bot_profile_versions v ON v.bot_id = p.id AND v.version = p.current_version WHERE p.id = ?`)
+        .get(botId) as { json: string };
+      return JSON.parse(row.json).cloudAvatarFallback;
+    };
+    expect(readProvenance()).toBe(true);
+    await updateStoredBotProfile({ id: created.id, name: 'Renamed fallback',
+      capabilities: { cloudAvatarFallback: false } });
+    expect(readProvenance()).toBe(true);
+    await updateStoredBotProfile({ id: created.id, avatar: '🦊' }, undefined, undefined, { avatarFallback: false });
+    expect(readProvenance()).toBeUndefined();
+    await updateStoredBotProfile({ id: created.id, avatar: '🤖' }, undefined, undefined, { avatarFallback: true });
+    expect(readProvenance()).toBe(true);
+    const original = await createBotProfile({ name: 'Real image source' });
+    const image = { buffer: readFileSync(resolveSafe(original.avatar).absPath), mimeType: 'image/png' };
+    await expect(setBotProfileAvatar(created.id, image, 0)).rejects.toThrow('PRECONDITION_FAILED');
+    expect(readProvenance()).toBe(true);
+    const updated = await setBotProfileAvatar(created.id, image);
+    expect(updated.avatar).toBe(original.avatar);
+    expect(readProvenance()).toBeUndefined();
+    await updateStoredBotProfile({ id: created.id, capabilities: { cloudAvatarFallback: true } });
+    expect(readProvenance()).toBeUndefined();
+    const untrusted = await createBotProfile({ name: 'Ordinary emoji', avatar: '🤖', capabilities: { cloudAvatarFallback: true } });
+    expect(readProvenance(untrusted.id)).toBeUndefined();
   });
 
   it('creates a real gallery portrait when the shared tool entry receives only a name', async () => {
