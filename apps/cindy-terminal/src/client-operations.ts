@@ -97,10 +97,12 @@ export async function waitForTurn(client: TerminalClient, sessionId: string, req
       const recovery = object(projection.recovery);
       const failedInput = recovery.kind === 'queue-head' ? recovery.clientId : object(recovery.item).clientId;
       if (projection.error && failedInput === requestId) return { sessionId, requestId, status: 'failed', errorCode: String(projection.errorReason ?? 'TURN_FAILED') };
-      const pending = !queued?unwrap(await client.invoke('maker:get-pending-interactions', [sessionId], options.device)):[];
-      if (Array.isArray(pending) && pending.length) return { sessionId, requestId, status: 'waiting', pendingRequests: pending };
       const running = projection.turnInProgress ?? unwrap(await client.invoke('maker:session-in-turn', [sessionId], options.device));
-      if (running !== true && !queued && !projection.autoResumePending && !projection.usageLimitWait) {
+      // An accepted delivery can finish while a later request keeps the
+      // session busy. Correlate history for this request as soon as the host
+      // has durably accepted it; waiting for the session-wide busy flag would
+      // make request A time out behind request B.
+      if ((!running || receipt?.state === 'accepted') && !queued) {
         const messages:Record<string,unknown>[]=[];
         let before: string|undefined;
         // A long tool run can put its user row beyond the newest history page.
@@ -130,6 +132,8 @@ export async function waitForTurn(client: TerminalClient, sessionId: string, req
           return { sessionId, requestId, status: 'failed', errorCode: 'TURN_FAILED' };
         }
       }
+      const pending = !queued?unwrap(await client.invoke('maker:get-pending-interactions', [sessionId], options.device)):[];
+      if (Array.isArray(pending) && pending.length) return { sessionId, requestId, status: 'waiting', pendingRequests: pending };
       last = { sessionId, requestId, status: queued ? 'queued' : 'running' };
     try { await pause(400, undefined, { signal: options.signal }); } catch { break; }
   }

@@ -539,7 +539,7 @@ function TerminalApp({ client, locale: initialLocale, initialPage, initialTask, 
     if(!task&&page!=='resources'&&(key.ctrl&&input==='f'||input==='/')){edit(t.search,[{key:'query',label:t.search,value:filter,optional:true}],async values=>{setFilter(values.query);setSelected(0);setForm(null);});return;}
     if (key.tab) { const pages=['tasks','models','connections','resources','service']; navigate(pages[(pages.indexOf(page)+(key.shift?pages.length-1:1))%pages.length]);return; }
     if (page === 'resources') return;
-    if (key.escape) { if (task) {setTask(undefined);setDraft('');} else if(page==='connection')navigate('connections');else if(page==='engine')navigate('engines');else if(page==='engines'||page==='providers')navigate('models');else navigate('tasks'); return; }
+    if (key.escape) { if (task) {setTask(undefined);setDraft('');setAttachments([]);} else if(page==='connection')navigate('connections');else if(page==='engine')navigate('engines');else if(page==='engines'||page==='providers')navigate('models');else navigate('tasks'); return; }
     if (task) {
       if(key.ctrl&&input==='p'){void action(taskCommands);return;}
       if ((input === '\u001bOQ' || input === '\u001b[12~') && pending.length) { setReviewRequest(true); return; }

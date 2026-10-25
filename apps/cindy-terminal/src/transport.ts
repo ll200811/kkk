@@ -17,6 +17,41 @@ function sameProof(a: unknown, b: string) {
   if (typeof a !== 'string' || a.length !== b.length) return false;
   return timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
+/**
+ * A service.json pid is only a hint: after a crash or pid reuse it may refer
+ * to an unrelated process. Prove ownership through the endpoint's HMAC
+ * handshake before treating the record as a live Cindy service.
+ */
+async function probeEndpoint(endpoint: Endpoint): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.createConnection(endpoint.socket);
+    let verifiedServer = false;
+    let settled = false;
+    const nonce = randomBytes(32).toString('hex');
+    let timer: NodeJS.Timeout;
+    const finish = (alive: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(alive);
+    };
+    timer = setTimeout(() => finish(false), 750);
+    timer.unref();
+    socket.once('connect', () => write(socket, { type: 'hello', nonce }));
+    socket.once('error', () => finish(false));
+    socket.once('close', () => finish(false));
+    frames(socket, frame => {
+      if (frame.type === 'challenge' && typeof frame.nonce === 'string'
+        && /^[a-f0-9]{64}$/.test(frame.nonce)
+        && sameProof(frame.proof, proof(endpoint.key, 'server', nonce, frame.nonce))) {
+        verifiedServer = true;
+        write(socket, { type: 'authenticate', proof: proof(endpoint.key, 'client', nonce, frame.nonce) });
+      } else if (frame.type === 'ready' && verifiedServer) finish(true);
+      else finish(false);
+    });
+  });
+}
 function write(socket: Socket, value: Frame) {
   const frame = JSON.stringify(value) + '\n';
   if (Buffer.byteLength(frame) > MAX_FRAME || socket.writableLength > MAX_FRAME * 2) { socket.destroy(); return; }
@@ -65,9 +100,7 @@ export class TerminalTransportServer {
     if (previous) {
       const old = JSON.parse(previous.toString()) as Endpoint;
       if (old.version !== 1 || !Number.isSafeInteger(old.pid) || old.pid <= 0 || old.socket !== this.endpoint.socket) throw new Error('SERVICE_ENDPOINT_INVALID');
-      let alive = true;
-      try { process.kill(old.pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
-      if (alive) throw new Error('SERVICE_ALREADY_RUNNING');
+      if (await probeEndpoint(old)) throw new Error('SERVICE_ALREADY_RUNNING');
       if (process.platform !== 'win32' && old.socket === this.endpoint.socket) {
         const stat = await fs.lstat(old.socket).catch(() => null);
         if (stat && (!stat.isSocket() || stat.uid !== process.getuid?.())) throw new Error('UNSAFE_SERVICE_SOCKET');
