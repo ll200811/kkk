@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isValidPluginNamespace } from '@cindy/plugin-protocol';
 import { parseMessageToolUse } from '@cindy/maker-shared/message-normalize';
 import { readTurnResources, type TurnResourceReceipt } from '@cindy/maker-shared/turn-resources';
 import { GHOST_CALL_TOOL_NAMES, isGhostCallToolName, isValidGhostId } from '../shared/ghost.js';
@@ -35,6 +36,8 @@ function resultPayload(value: unknown): unknown {
   return decoded;
 }
 
+const SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
+
 function pluginInvocation(toolName: string, input: unknown) {
   const tool = parseMessageToolUse({ role: 'tool_use', content: { toolName, input } });
   const args = record(tool.input);
@@ -45,7 +48,7 @@ function pluginInvocation(toolName: string, input: unknown) {
   const ghostId = identity?.ghostId ?? (isValidGhostId(rawId) ? rawId : null);
   if (!ghostId) return;
   const namespace = identity ? identity.namespace : args.namespace;
-  if (namespace !== undefined && namespace !== null && (typeof namespace !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(namespace))) return;
+  if (namespace !== undefined && namespace !== null && !isValidPluginNamespace(namespace)) return;
   return { rawId, ghostId, namespace: namespace as string | null | undefined, args };
 }
 
@@ -59,6 +62,15 @@ function pluginExecutionIdentity(invocation: NonNullable<ReturnType<typeof plugi
 export function readExecutedPluginIdentity(toolName: string, input: unknown, result: unknown): string | undefined {
   const invocation = pluginInvocation(toolName, input);
   return invocation && record(resultPayload(result))?.ok === true ? pluginExecutionIdentity(invocation) : undefined;
+}
+
+/** Native Skill success comes from its exact original result, never a display summary. */
+export function readExecutedSkillIdentity(toolName: string, input: unknown, result: unknown): string | undefined {
+  const skill = record(input)?.skill;
+  if (toolName !== 'Skill' || typeof skill !== 'string' || !SKILL_NAME_PATTERN.test(skill)) return;
+  const text = resultPayload(result);
+  if (typeof text !== 'string' || !text.trim() || text.includes('<tool_use_error>')) return;
+  return createTurnResourceReceipt('skill', `claude:${skill}`, skill)?.id;
 }
 
 /** Run inside the durable message FIFO, after tool writes and before the final seal. */
@@ -79,13 +91,18 @@ export async function readTurnResourcesForReply(
   const replyMeta = record(decode(reply.meta));
   if (replyMeta?.parentUuid || replyMeta?.failedSamplingAttempt || replyMeta?.assistantPhase === 'commentary'
     || !inputs.includes(String(replyMeta?.replyToClientId ?? ''))) return [];
-  const rows = await db.query<{ content: string; meta: string | null; agentKind: string | null; result: string | null }>(`
+  const rows = await db.query<{ content: string; meta: string | null; agentKind: string | null; result: string | null; resultRewindAt: number | null }>(`
     SELECT tool.content, tool.agent_meta AS meta, tool.agent_kind AS agentKind,
       (SELECT result.content FROM messages result
         WHERE result.session_id=tool.session_id AND result.role='tool_result'
           AND result.tool_use_id=tool.tool_use_id AND result.rewind_at IS NULL
           AND result.rowid>tool.rowid AND result.rowid<? AND result.created_at<=?
-        ORDER BY result.created_at DESC, result.rowid DESC LIMIT 1) AS result
+        ORDER BY result.created_at DESC, result.rowid DESC LIMIT 1) AS result,
+      (SELECT result.rewind_at FROM messages result
+        WHERE result.session_id=tool.session_id AND result.role='tool_result'
+          AND result.tool_use_id=tool.tool_use_id
+          AND result.rowid>tool.rowid AND result.rowid<? AND result.created_at<=?
+        ORDER BY result.created_at DESC, result.rowid DESC LIMIT 1) AS resultRewindAt
     FROM messages tool JOIN sessions s ON s.id=tool.session_id
     JOIN messages input ON input.session_id=tool.session_id AND input.role='user' AND input.rewind_at IS NULL
       AND input.client_id=json_extract(CASE WHEN json_valid(tool.agent_meta) THEN tool.agent_meta ELSE '{}' END, '$.replyToClientId')
@@ -97,18 +114,23 @@ export async function readTurnResourcesForReply(
       AND tool.rowid<? AND tool.created_at<=?
       AND (s.cleared_at IS NULL OR (input.created_at>s.cleared_at AND tool.created_at>s.cleared_at))
     ORDER BY tool.created_at, tool.rowid
-  `, [reply.rowid, reply.createdAt, sessionId,
+  `, [reply.rowid, reply.createdAt, reply.rowid, reply.createdAt, sessionId,
     JSON.stringify(['Skill', 'Workflow', 'cindy_mcp_call_tool', ...GHOST_CALL_TOOL_NAMES]),
     JSON.stringify(inputs), reply.rowid, reply.createdAt]);
   const resources: TurnResourceReceipt[] = [];
   for (const row of rows) {
+    // A grouped invocation may have no result row; an explicitly rewound result
+    // is different and must not be restored merely because its tool has a Host fact.
+    if (row.resultRewindAt !== null) continue;
     const tool = parseMessageToolUse({ role: 'tool_use', content: decode(row.content) });
     const input = record(tool.input);
     if (!input) continue;
     const meta = record(decode(row.meta));
+    // Child tools inherit replyToClientId; their invocation facts belong to the child.
+    if (meta?.parentUuid) continue;
     const result = resultPayload(row.result);
     const text = typeof result === 'string' ? result : '';
-    if ((tool.toolName === 'Skill' || tool.toolName === 'Workflow') && text.includes('<tool_use_error>')) continue;
+    if (tool.toolName === 'Workflow' && text.includes('<tool_use_error>')) continue;
     if (tool.toolName === 'Workflow') {
       // A native named-start event is stronger than a launch prompt or a tool-call attempt.
       const workflow = readTurnResources([meta?.workflowResource]).find(item => item.kind === 'workflow');
@@ -116,17 +138,16 @@ export async function readTurnResourcesForReply(
       continue;
     }
     if (tool.toolName === 'Skill' && (row.agentKind === 'claude-code' || row.agentKind === 'cc')) {
-      if (row.result === null) continue;
-      if (typeof input.skill !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(input.skill)) continue;
+      if (typeof input.skill !== 'string' || !SKILL_NAME_PATTERN.test(input.skill)) continue;
       const skill = createTurnResourceReceipt('skill', `claude:${input.skill}`, input.skill);
-      if (skill) resources.push(skill);
+      if (skill && meta?.turnResourceSkillExecutionId === skill.id) resources.push(skill);
       continue;
     }
     const invocation = pluginInvocation(tool.toolName, input);
     if (!invocation) continue;
-    // New rows keep the exact invocation's host fact even when its result was capped.
-    // Old rows can still use a complete ok:true envelope, never a text-prefix guess.
-    if (meta?.turnResourcePluginExecutionId !== pluginExecutionIdentity(invocation) && record(result)?.ok !== true) continue;
+    // A merged result can be stored under another invocation's primary tool ID.
+    // Only the exact host fact proves this invocation ran, even after result capping.
+    if (meta?.turnResourcePluginExecutionId !== pluginExecutionIdentity(invocation)) continue;
     const { rawId, ghostId } = invocation;
     let { namespace } = invocation;
     let name = ghostId;

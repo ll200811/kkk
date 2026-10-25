@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 vi.mock('../localDb/client/current.js', () => ({ getDbClient: vi.fn() }));
 vi.mock('../cindy-brain/index.js', () => ({ findGhostForInstanceId: vi.fn() }));
 import { findGhostForInstanceId } from '../cindy-brain/index.js';
-import { createTurnResourceReceipt, readExecutedPluginIdentity, readTurnResourcesForReply } from '../readTurnResourcesForReply';
+import { createTurnResourceReceipt, readExecutedPluginIdentity, readExecutedSkillIdentity, readTurnResourcesForReply } from '../readTurnResourcesForReply';
 import { readTurnResources } from '@cindy/maker-shared/turn-resources';
 import { capToolResultTextForPersist } from '../../shared/toolResultPersistCap';
 import type { DbClient } from '../localDb/client/DbClient';
@@ -24,7 +24,12 @@ function row(id: string, role: string, content: unknown, meta: object = {}, tool
     .run(session, id, role, typeof content === 'string' ? content : JSON.stringify(content), JSON.stringify(meta), toolUseId, agentKind, ++time);
 }
 function call(id: string, toolName: string, input: object, result: unknown = { ok: true, result: {} }, owner = 'input', agentKind = 'claude-code') {
-  row(id, 'tool_use', { toolName, input }, { replyToClientId: owner }, id, agentKind);
+  // Model a single invocation's host fact, before its result is stored or capped.
+  const executionId = readExecutedPluginIdentity(toolName, input, result);
+  const skillExecutionId = readExecutedSkillIdentity(toolName, input, result);
+  row(id, 'tool_use', { toolName, input }, { replyToClientId: owner,
+    ...(executionId ? { turnResourcePluginExecutionId: executionId } : {}),
+    ...(skillExecutionId ? { turnResourceSkillExecutionId: skillExecutionId } : {}) }, id, agentKind);
   if (result !== null) row(`${id}-result`, 'tool_result', result, { replyToClientId: owner }, id, agentKind);
 }
 function final(id = 'final', owner = 'input') { row(id, 'assistant', 'Result', { replyToClientId: owner }); }
@@ -94,10 +99,65 @@ it('cannot derive an execution identity from discovery, grants, malformed inputs
     ['mcp:cindy:ghost_call', { ...input, tool: 'call_tool', args: { name: 'list_tools' } }, { ok: true }],
     ['mcp:cindy:ghost_call', { ...input, grant_only: true }, { ok: true }],
     ['mcp:cindy:ghost_call', { ...input, ghost_id: '/private/path' }, { ok: true }],
+    ['mcp:cindy:ghost_call', { ...input, namespace: 'a'.repeat(129) }, { ok: true }],
     ['mcp:cindy:ghost_call', input, { ok: false }],
     ['mcp:cindy:ghost_call', input, '{"ok":true,'],
     ['mcp:untrusted:ghost_call', input, { ok: true }],
   ] as const) expect(readExecutedPluginIdentity(toolName, args, result)).toBeUndefined();
+});
+
+// #7113: the shared namespace contract allows 128 characters. The old local
+// 100-character regex silently omitted real plugin calls. Unit, SQLite receipt output.
+it.each([101, 128])('retains exact host executions for a %i-character namespace and its instance alias', async length => {
+  const namespace = 'a'.repeat(length);
+  const direct = { ghost_id: 'github', namespace, tool: 'search' };
+  const alias = { ghost_id: `_ns/${namespace}/github`, tool: 'search' };
+  const identity = readExecutedPluginIdentity('mcp:cindy:ghost_call', direct, { ok: true });
+  expect(identity).toBeTruthy();
+  expect(readExecutedPluginIdentity('mcp:cindy:ghost_call', alias, { ok: true })).toBe(identity);
+  call('direct-plugin', 'mcp:cindy:ghost_call', direct);
+  call('alias-plugin', 'mcp:cindy:ghost_call', alias);
+  final();
+  expect((await bind()).map(item => [item.kind, item.name, item.id])).toEqual([['plugin', 'github', identity]]);
+});
+
+// #7113: a combined result belongs to several IDs, not necessarily the primary
+// row that stores its text. Only an invocation's exact host fact proves execution.
+it('does not infer plugin execution from an unstamped aggregate result', async () => {
+  const accepted = { ghost_id: 'github', tool: 'search' };
+  row('rejected-primary', 'tool_use', { toolName: 'mcp:cindy:ghost_call', input: { ghost_id: 'rejected-plugin', tool: 'search' } },
+    { replyToClientId: 'input' }, 'rejected-primary');
+  row('accepted-secondary', 'tool_use', { toolName: 'mcp:cindy:ghost_call', input: accepted },
+    { replyToClientId: 'input', turnResourcePluginExecutionId: readExecutedPluginIdentity('mcp:cindy:ghost_call', accepted, { ok: true }) },
+    'accepted-secondary');
+  row('aggregate-result', 'tool_result', { ok: true, result: {} }, { replyToClientId: 'input' }, 'rejected-primary');
+  final();
+  expect((await bind()).map(item => item.name)).toEqual(['github']);
+});
+
+// #7113: generated summaries can overwrite a failed Skill's display result.
+// Existing result checks only cover an unchanged error string; unit, SQLite output.
+it('does not infer Skill success after its failed full result is replaced by a successful-looking summary', async () => {
+  call('failed-skill', 'Skill', { skill: 'review' }, '<tool_use_error>Unknown skill</tool_use_error>');
+  sqlite.prepare('UPDATE messages SET content=? WHERE client_id=?')
+    .run('Skill review was loaded and the requested work was completed.', 'failed-skill-result');
+  final();
+  expect(await bind()).toEqual([]);
+});
+
+// #7113: grouped results may be stored only under another tool's primary ID.
+// The exact Skill Host fact must survive without its own display row; unit.
+it('retains a successful non-primary Skill with its Host fact and no individual result row', async () => {
+  row('primary-read', 'tool_use', { toolName: 'Read', input: { file_path: '/fixture/input' } },
+    { replyToClientId: 'input' }, 'primary-read');
+  const input = { skill: 'review' };
+  row('secondary-skill', 'tool_use', { toolName: 'Skill', input }, {
+    replyToClientId: 'input',
+    turnResourceSkillExecutionId: readExecutedSkillIdentity('Skill', input, 'Launching skill: review'),
+  }, 'secondary-skill');
+  row('aggregate-result', 'tool_result', 'Both tools completed.', { replyToClientId: 'input' }, 'primary-read');
+  final();
+  expect((await bind()).map(item => item.name)).toEqual(['review']);
 });
 
 it('omits discovery, rejected or unconfirmed calls, prompt-only workflows and non-Claude Skill lookalikes', async () => {
@@ -132,6 +192,21 @@ it('uses all exact accepted inputs across steering, excluding queued, later and 
   row('other-tool', 'tool_use', { toolName: 'Skill', input: { skill: 'other' } }, { replyToClientId: 'input' }, 'other-tool', 'claude-code', 'other');
   expect((await bind(['input', 'steer'])).map(item => item.name)).toEqual(['early', 'steered']);
   expect(await bind(['queued'])).toEqual([]);
+});
+
+// #7113: child tools inherit the accepted input, so replyToClientId alone cannot
+// identify the parent turn. Existing ownership cases only vary input/session IDs.
+it('excludes child Skill and plugin calls sharing the parent input before deduplicating parent receipts', async () => {
+  call('child-only-skill', 'Skill', { skill: 'child-only' }, 'loaded');
+  call('child-only-plugin', 'mcp:cindy:ghost_call', { ghost_id: 'child-plugin', tool: 'search' });
+  call('child-shared-skill', 'Skill', { skill: 'shared' }, 'loaded');
+  call('child-shared-plugin', 'mcp:cindy:ghost_call', { ghost_id: 'github', tool: 'search' });
+  sqlite.prepare("UPDATE messages SET agent_meta=json_set(agent_meta, '$.parentUuid', ?) WHERE client_id LIKE 'child-%'")
+    .run('delegated-tool');
+  call('parent-skill', 'Skill', { skill: 'shared' }, 'loaded');
+  call('parent-plugin', 'mcp:cindy:ghost_call', { ghost_id: 'github', tool: 'search' });
+  final();
+  expect((await bind()).map(item => [item.kind, item.name])).toEqual([['skill', 'shared'], ['plugin', 'github']]);
 });
 
 it.each(['input', 'tool', 'result', 'reply', 'clear'] as const)('honours the visible %s boundary when history was rewound or cleared', async boundary => {

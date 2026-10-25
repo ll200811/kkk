@@ -1,7 +1,7 @@
 import { materializeToolProcessMedia } from './cindy-media/toolProcessMedia.js';
 import { withToolProcessMedia, type ProcessMediaRef, type NativeToolMedia } from '@cindy/maker-shared/tool-process-media';
 import { readTaskResultsForReply } from './botTaskReplyResults.js';
-import { createTurnResourceReceipt, readExecutedPluginIdentity, readTurnResourcesForReply } from './readTurnResourcesForReply.js';
+import { createTurnResourceReceipt, readExecutedPluginIdentity, readExecutedSkillIdentity, readTurnResourcesForReply } from './readTurnResourcesForReply.js';
 /**
  * messagePersistBroadcaster — 把 agent 消息的持久化从 renderer 收口到 main 单点。
  * ---------------------------------------------------------------------------
@@ -1010,10 +1010,11 @@ function agentTaskMetaForToolUse(
   toolName: string,
   agentMeta: AgentMeta | null,
 ): AgentMeta | null {
-  // Provider metadata cannot mint the host-only plugin execution fact.
-  if (agentMeta && 'turnResourcePluginExecutionId' in agentMeta) {
-    const sanitized = { ...agentMeta } as AgentMeta & { turnResourcePluginExecutionId?: unknown };
+  // Provider metadata cannot mint host-only execution facts.
+  if (agentMeta && ('turnResourcePluginExecutionId' in agentMeta || 'turnResourceSkillExecutionId' in agentMeta)) {
+    const sanitized = { ...agentMeta } as AgentMeta & { turnResourcePluginExecutionId?: unknown; turnResourceSkillExecutionId?: unknown };
     delete sanitized.turnResourcePluginExecutionId;
+    delete sanitized.turnResourceSkillExecutionId;
     agentMeta = sanitized;
   }
   if (!toolUseId || !isAgentTaskToolName(toolName)) return agentMeta;
@@ -1704,20 +1705,21 @@ function toolResultMeta(sessionId: string, agentMeta: AgentMeta | null): AgentMe
 }
 
 /** A capped tool_result is display text, not execution evidence. Keep the host fact separately. */
-function rememberExecutedPlugin(sessionId: string, toolUseIds: readonly string[], fullText: string): void {
-  for (const toolUseId of toolUseIds) {
-    const info = toolUseInfoBySession.get(sessionId)?.get(toolUseId);
-    if (!info) continue;
-    const identity = readExecutedPluginIdentity(info.toolName, info.input, fullText);
-    if (!identity) continue;
-    const persistScope = captureAgentTaskPersistScope(sessionId);
-    enqueueWrite(`plugin_execution:${sessionId}:${toolUseId}`, async () => {
-      if (agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
-      const row = await findVisibleToolUseMessageByAliases(sessionId, [toolUseId]);
-      if (!row || agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
-      await patchMessageAgentMetaWithResult(sessionId, row.clientId, { turnResourcePluginExecutionId: identity });
-    });
-  }
+function rememberExecutedResource(sessionId: string, toolUseId: string, fullText: string): void {
+  const info = toolUseInfoBySession.get(sessionId)?.get(toolUseId);
+  if (!info) return;
+  const pluginId = readExecutedPluginIdentity(info.toolName, info.input, fullText);
+  const skillId = readExecutedSkillIdentity(info.toolName, info.input, fullText);
+  const fact = pluginId ? { turnResourcePluginExecutionId: pluginId }
+    : skillId ? { turnResourceSkillExecutionId: skillId } : undefined;
+  if (!fact) return;
+  const persistScope = captureAgentTaskPersistScope(sessionId);
+  enqueueWrite(`plugin_execution:${sessionId}:${toolUseId}`, async () => {
+    if (agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
+    const row = await findVisibleToolUseMessageByAliases(sessionId, [toolUseId]);
+    if (!row || agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
+    await patchMessageAgentMetaWithResult(sessionId, row.clientId, fact);
+  });
 }
 
 /**
@@ -1761,7 +1763,7 @@ export function onToolResultEvent(
 ): { persistId: string; content: string } | null {
   const summary = typeof data.summary === 'string' ? data.summary : '';
   const ids = Array.isArray(data.toolUseIds)
-    ? data.toolUseIds.filter((x): x is string => typeof x === 'string' && x.length > 0)
+    ? [...new Set(data.toolUseIds.filter((x): x is string => typeof x === 'string' && x.length > 0))]
     : [];
   if (scope === 'background' && ids.length === 0) return null;
 
@@ -1784,9 +1786,12 @@ export function onToolResultEvent(
   let usedBufferedContent = false;
 
   // 摘要 vs buffer 全文:取更长者;消费 buffer。
+  // Summaries are display text (Claude can generate them); only an exact ID's
+  // original full result proves execution, even for a single-ID summary.
   let content = summary;
   for (const id of ids) {
     const buffered = pending.get(id);
+    if (scope === 'turn' && buffered) rememberExecutedResource(sessionId, id, buffered.text);
     if (buffered && buffered.text.length > content.length) {
       content = buffered.text;
       createdAt = clampAfterToolUse(sessionId, id, buffered.createdAt, createdAtMap);
@@ -1797,7 +1802,6 @@ export function onToolResultEvent(
   if (usedBufferedContent) {
     createdAt = clampAfterLatestToolUse(sessionId, ids, createdAt, createdAtMap);
   }
-  if (scope === 'turn') rememberExecutedPlugin(sessionId, ids, content);
   const primaryToolUseId = ids[0];
 
   // 已有映射(多 toolUseId 归并到同一条)?
@@ -1925,7 +1929,7 @@ export function onToolResultFullEvent(
     releaseBackgroundStateForToolUses(sessionId, backgroundState, [toolUseId]);
     return null;
   }
-  if (scope === 'turn') rememberExecutedPlugin(sessionId, [toolUseId], fullText);
+  if (scope === 'turn') rememberExecutedResource(sessionId, toolUseId, fullText);
   const idMap = backgroundState?.toolResultIdByToolUseId ??
     getOrCreateSessionMap(toolResultIdByToolUseId, sessionId);
   const pending = backgroundState?.pendingFullTextByToolUseId ??
@@ -2132,7 +2136,7 @@ export function flushOrphanToolResults(sessionId: string, agentMeta: AgentMeta |
   const contentMap = getOrCreateSessionMap(toolResultContentByClientId, sessionId);
   const meta = toolResultMeta(sessionId, agentMeta);
   const persistOrphan = (toolUseId: string, text: string, createdAt: number): void => {
-    rememberExecutedPlugin(sessionId, [toolUseId], text);
+    rememberExecutedResource(sessionId, toolUseId, text);
     const persistId = createId();
     idMap.set(toolUseId, persistId);
     contentMap.set(persistId, text);

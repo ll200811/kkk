@@ -9,7 +9,7 @@ vi.mock('../readTurnResourcesForReply.js', async importOriginal => ({
   ...await importOriginal<typeof import('../readTurnResourcesForReply.js')>(),
   readTurnResourcesForReply: vi.fn(async () => []),
 }));
-import { createTurnResourceReceipt, readExecutedPluginIdentity, readTurnResourcesForReply } from '../readTurnResourcesForReply.js';
+import { createTurnResourceReceipt, readExecutedPluginIdentity, readExecutedSkillIdentity, readTurnResourcesForReply } from '../readTurnResourcesForReply.js';
 /**
  * messagePersistBroadcaster.test.ts
  * ---------------------------------------------------------------------------
@@ -4401,7 +4401,7 @@ it('records only a native named Workflow start and drops an in-flight record aft
 
 // Unit: all existing result assembly orders must preserve execution before the
 // display-only 8KB cap, without accepting provider-supplied resource metadata.
-it.each(['summary', 'full', 'buffered', 'update'] as const)('keeps a host plugin execution fact before capping its %s result', async order => {
+it.each(['full', 'buffered', 'update'] as const)('keeps a host plugin execution fact before capping its %s result', async order => {
   const toolName = 'mcp__cindy__ghost_call';
   const input = { ghost_id: 'github', namespace: 'team', tool: 'search' };
   const fullText = JSON.stringify({ ok: true, result: { text: 'x'.repeat(10000) } });
@@ -4411,8 +4411,8 @@ it.each(['summary', 'full', 'buffered', 'update'] as const)('keeps a host plugin
   const providerMeta = { replyToClientId: 'accepted', turnResourcePluginExecutionId: 'provider-forgery' };
   onToolUseEvent(SESSION, { toolUseId: 'large-plugin', toolName, input }, providerMeta);
   if (order === 'update') onToolResultEvent(SESSION, { toolUseIds: ['large-plugin'], summary: 'pending' }, null);
-  if (order === 'summary' || order === 'buffered') {
-    onToolResultEvent(SESSION, { toolUseIds: ['large-plugin'], summary: order === 'buffered' ? '' : fullText }, null);
+  if (order === 'buffered') {
+    onToolResultEvent(SESSION, { toolUseIds: ['large-plugin'], summary: '' }, null);
   } else onToolResultFullEvent(SESSION, { toolUseId: 'large-plugin', fullText }, null);
   await drainPersistQueue();
   const toolUse = vi.mocked(createMessage).mock.calls.find(([, body]) => body.role === 'tool_use')?.[1];
@@ -4438,6 +4438,55 @@ it('does not stamp plugin execution from discovery, rejected calls or a forged p
   for (const [, body] of vi.mocked(createMessage).mock.calls.filter(([, body]) => body.role === 'tool_use'))
     expect(body.agentMeta).not.toHaveProperty('turnResourcePluginExecutionId');
 });
+
+// #7113 review: a grouped display result cannot prove every invocation ran.
+// Buffer full results before tool_use so only their exact IDs can supply facts.
+it.each(['buffered', 'single-summary', 'group-summary'] as const)('does not share plugin execution evidence across a %s result', async order => {
+  const toolName = 'mcp__cindy__ghost_call';
+  const successInput = { ghost_id: 'github', tool: 'search' };
+  const rejectedInput = { ghost_id: 'notion', tool: 'query' };
+  const success = JSON.stringify({ ok: true, result: { text: 'x'.repeat(10000) } });
+  if (order === 'buffered') {
+    onToolResultFullEvent(SESSION, { toolUseId: 'plugin-success', fullText: success }, null);
+    onToolResultFullEvent(SESSION, { toolUseId: 'plugin-rejected', fullText: '{"ok":false}' }, null);
+  }
+  vi.mocked(findVisibleToolUseMessageByAliases).mockImplementation(async (_session, aliases) => ({
+    clientId: `${aliases[0]}-row`, toolUseId: aliases[0],
+  }));
+  onToolUseEvent(SESSION, { toolUseId: 'plugin-rejected', toolName, input: rejectedInput }, null);
+  onToolUseEvent(SESSION, { toolUseId: 'plugin-success', toolName, input: successInput }, null);
+  onToolResultEvent(SESSION, { toolUseIds: order === 'single-summary' ? ['plugin-rejected'] : ['plugin-rejected', 'plugin-success'],
+    summary: order === 'buffered' ? '' : success }, null);
+  await drainPersistQueue();
+  const facts = vi.mocked(patchMessageAgentMetaWithResult).mock.calls
+    .filter(([, , meta]) => 'turnResourcePluginExecutionId' in meta);
+  expect(facts.map(([, id]) => id)).toEqual(order === 'buffered' ? ['plugin-success-row'] : []);
+  if (order === 'buffered') expect(facts[0][2]).toEqual({
+    turnResourcePluginExecutionId: readExecutedPluginIdentity(toolName, successInput, success),
+  });
+});
+
+// #7113: native errors must survive a later, longer generated summary. Unit:
+// observe host metadata persisted by the real full/buffer/summary event handlers.
+it.each([['full', false], ['full', true], ['buffered', false], ['buffered', true]] as const)(
+  'keeps exact Skill success across a %s result and later summary (isError=%s)', async (order, isError) => {
+    const input = { skill: 'review' };
+    const fullText = isError ? 'Skill could not be loaded' : 'Launching skill: review';
+    const providerMeta = { replyToClientId: 'accepted', turnResourceSkillExecutionId: 'provider-forgery' };
+    vi.mocked(findVisibleToolUseMessageByAliases).mockResolvedValue({ clientId: 'skill-row', toolUseId: 'native-skill' });
+    if (order === 'buffered') onToolResultFullEvent(SESSION, { toolUseId: 'native-skill', fullText, isError }, null);
+    onToolUseEvent(SESSION, { toolUseId: 'native-skill', toolName: 'Skill', input }, providerMeta);
+    if (order === 'full') onToolResultFullEvent(SESSION, { toolUseId: 'native-skill', fullText, isError }, null);
+    onToolResultEvent(SESSION, { toolUseIds: ['native-skill'], summary: 'Displayed summary '.repeat(100) }, null);
+    await drainPersistQueue();
+    const facts = vi.mocked(patchMessageAgentMetaWithResult).mock.calls.filter(([, , meta]) => 'turnResourceSkillExecutionId' in meta);
+    expect(facts.map(([, , meta]) => meta)).toEqual(isError ? [] : [{
+      turnResourceSkillExecutionId: readExecutedSkillIdentity('Skill', input, fullText),
+    }]);
+    const tool = vi.mocked(createMessage).mock.calls.find(([, row]) => row.role === 'tool_use')?.[1];
+    expect(tool?.agentMeta).not.toHaveProperty('turnResourceSkillExecutionId');
+  },
+);
 
 // Unit regression: a late import updates the original result, never the next turn.
 it('persists process media on its accepted result and broadcasts the durable row', async () => {
