@@ -1,5 +1,14 @@
 # 跨端协议兼容
 
+## 终端宿主的内核管理
+
+终端宿主通过既有 `maker:remote-resources:*` 声明可选 `engines` 集合，包含当前版本、
+安装／更新／修复动作和 `engine-status` 展示块；后者始终提供文本回退。控制端只在目标
+声明该集合后提供入口，旧宿主没有集合时报告能力不可用，不能转为操作控制端的内核。
+动作立即返回宿主持有的操作标识，控制端只读取同一操作的结果；断线不重发安装。
+后台操作在账号切换或服务停止时取消，仍在使用的版本只有验证新可执行文件成功后才替换。
+既有同账号授权和共享任务访客限制保持不变，无新 relay 类型、服务端依赖或协议版本。
+
 ## Device Link 局域网优先直连
 
 可靠链路的 `link-open/link-accept` 增加可选能力 `direct-link-v1`。双方均支持且已完成
@@ -3266,3 +3275,60 @@ namespace + id 下同一插件的有界 JSON 请求；`deviceSync: true` 是独�
 本机新增 `local-db:bots:projects:list/set` 仅用于受信 renderer，不进入远程 IPC allowlist。
 旧 `workbench.json` 目录及设备归属沿用原格式；关联不进入任务负责范围或扩大文件权限。
 不改服务端、数据库 schema、Mobile 原生配置或指纹。
+
+## 无界面客户端的远程 Shell
+
+`terminal:remote-op` 是同账号设备控制中的独立聚合入口，`version: 1` 支持
+`capabilities / list / create / read / write / resize / close`。它复用 Desktop
+原有 PTY 与 Shell 选择实现；普通 GUI 的 `terminal:*` 窗口接口保持原行为。
+共享任务和供应商分享的访客 allowlist 不包含此入口。每个 PTY 绑定宿主账号代次、
+服务端验证的控制设备 ID 和终端 ID，另一个控制设备不能通过猜 ID 读取或写入。
+账号切换与宿主退出关闭该账号的 PTY；控制端退出只分离，显式 `close` 才停止 Shell。
+
+输出为内存中的有界游标流，单 PTY 最多保留 2 MiB，单次读取最多约 256 KiB。
+超过保留窗口返回 `gap`，控制端明示更早输出不再可读；不把 Shell 输入或输出写入
+任务消息、模型上下文或日志。写入携带请求 ID，最近 256 个写入去重，ID 对应内容
+不同时拒绝。传输中断不盲目重发键盘输入。旧宿主没有此入口时返回未知通道，
+控制端说明不支持；原任务、文件、模型远控仍沿原协议工作，不要求旧端升级才能使用。
+
+定向回归覆盖控制设备隔离、重复输入、账号替换及输出窗口；跨平台安装包仍需分别
+完成真实 PTY 验收，不能由类型检查或内存测试推断。
+
+## 终端插件配置导航
+
+`terminal:plugin-settings` 为可选的同账号推送，携带 `sessionId`、`target`
+（`plugin_settings` / `client_settings`）及已安装插件的 `ghostId`。它沿现有
+`session:<id>` 订阅转发，只为发起配置的任务切换终端页面，不包含凭证或授权值。
+共享任务和供应商访客不获得该通道。旧控制端忽略此导航，既有配置卡及资源查询继续
+可用；新终端也能从资源列表进入设置，不依赖新推送。插件市场与已安装插件使用现有
+Remote Resources 的列表、权限确认、隐藏输入和跨集合导航，不另加安装 IPC 或
+服务器协议版本。市场安装动作携带确切 Release ID，旧列表不能默许安装新 Release。
+
+终端配置凭证时，`credentials` 表单只发布已安装版本绑定与字段名称，普通资源 invoke
+不接收凭证值。TUI/CLI 改用本机专用 `terminal:plugin-secret`（不进远控 allowlist）；
+控制端通过签名输入桥 v3 和原 `/secrets` executor 提交到目标保险库。终端宿主新增
+`settings:form` 资源动作，为没有 HTML 页面的声明式表单签发相同的 owner/controller/
+installed revision 页面租约；请求只含 `expectedInstalledApproval`，不含秘密。真正的
+写入与关闭仍使用已存在的加密 `settings` 命令，未改信任模型或服务端。
+
+GUI/Mobile 的现有 `settings:open`、页面资源、授权和广播沿共享的 `MobilePluginPages`
+实现。旧宿主不支持新增表单动作时明确拒绝，不能降级把秘密送入通用 invoke；旧端已有
+插件设置行为保持不变。新终端表单与 HTML 设置共用原端点，插件更新、撤权、切账号与
+关闭页面后均不能继续写旧表单。声明式表单不是允许任意 IPC 或任意网络请求的通道。
+
+终端 MCP 的新增与编辑同样不经普通 resource invoke 传递令牌或请求头。三个入口
+（TUI、命名命令、通用 `resources action`）共用本机 `terminal:configuration` 控制器；
+此 IPC 不进入远程 allowlist。目标的 `mcp/configuration:open` 只接收操作名称和资源 ID，
+签发五分钟的单次租约，绑定当前账号、控制设备及配置代次。配置值通过现有签名加密
+v3 `settings` 帧交付，保留原 MCP 配置校验与保险库存储；没有新增加密算法或明文回退。
+宿主设置使用固定的内部身份 `__cindy_configuration__`，不注册成插件，也不能借该身份
+指定任意路径或调用任意 IPC。旧宿主不识别这个表单时返回不支持，由用户在目标本机配置。
+已打开的表单遇到配置修改、账号切换或宿主关闭即失效；同一表单不能再次执行写入。
+
+模型供应商和聊天渠道配置同样使用上述签名加密设置通道。`channels` 集合的普通详情
+只返回非秘密字段；`configuration:open` 绑定渠道 ID 与配置代次，令牌、AppSecret 等
+不进入普通资源调用、推送或日志。普通模型、权限、回复行为表单仍走资源动作。
+
+`binding:resolve-session`、`binding:list-attached`、`binding:revoke` 及
+`binding:changed` 为已有桌面接管接口的同账号远程入口。终端沿用原身份键与目标任务
+条件撤销；共享任务和供应商访客不获得这组通道。旧端原有本机接管能力保持不变。

@@ -5,10 +5,12 @@ import {
   FILE_PEER_CHANNEL, FILE_PEER_MAX_BYTES, FILE_PEER_CHUNK_BYTES, FILE_PEER_IDLE_MS,
   FILE_PEER_MAX_CONNECTIONS, FILE_PEER_WRITE_BATCH_BYTES,
   type FilePeerFile, type createNodeDirectRtcRuntime,
+  type FilePeerRuntimeBridge,
 } from '@cindy/device-link';
 import { TerminalRemoteError, type TerminalRemoteContext } from './types.js';
 
 type NativeRtc = Parameters<typeof createNodeDirectRtcRuntime>[0];
+export type TerminalFilePeerRuntime = Pick<ReturnType<typeof createNodeFilePeerRuntime>, 'offer'|'accept'|'answer'|'receive'|'close'|'dispose'>;
 interface FileSource {
   /** Already-open, authorized handle. Never resolve a remote string as a local path. */
   handle: FileHandle;
@@ -22,6 +24,7 @@ export interface TerminalFileSink<T> {
 }
 export interface TerminalFilePeerOptions {
   native: NativeRtc;
+  createRuntime?(bridge: FilePeerRuntimeBridge): TerminalFilePeerRuntime;
   getOwnerScope(): string | null;
   getIceServers?(): Promise<RTCIceServer[]>;
   /** Performs file URL/owner/workspace authorization before opening the handle. */
@@ -54,16 +57,16 @@ export class TerminalFilePeerService {
   private readonly connections = new Map<string, Connection>();
   private readonly sources = new Map<string, Source>();
   private readonly sinks = new Map<string, Sink>();
-  private readonly runtime: ReturnType<typeof createNodeFilePeerRuntime>;
+  private readonly runtime: TerminalFilePeerRuntime;
 
   constructor(private readonly options: TerminalFilePeerOptions) {
-    this.runtime = createNodeFilePeerRuntime({
+    this.runtime = (options.createRuntime ?? (bridge => createNodeFilePeerRuntime(bridge, options.native)))({
       closed: id => this.closeConnection(id),
       read: (id, ticket, offset) => this.read(id, ticket, offset),
       write: (id, offset, value) => this.write(id, offset, value),
       writeBatch: (id, offset, value) => this.write(id, offset, value),
       invoke: (id, payload, body) => this.rpc(id, payload, body),
-    }, options.native);
+    });
   }
 
   async request(value: unknown, context: TerminalRemoteContext): Promise<unknown> {
@@ -71,7 +74,7 @@ export class TerminalFilePeerService {
     const request = parseFilePeerRequest(value);
     if (request.action === 'caps') return {
       version: 1, maxBytes: FILE_PEER_MAX_BYTES, streaming: true,
-      attachments: !!this.options.attachment, largeAttachments: false,
+      attachments: !!this.options.attachment, largeAttachments: !!this.options.attachment,
       streamAttachments: !!this.options.attachment, idleMs: FILE_PEER_IDLE_MS,
       sessionBound: false,
     };
@@ -160,6 +163,7 @@ export class TerminalFilePeerService {
 
   stop(peer?: string): void {
     for (const connection of [...this.connections.values()]) if (!peer || connection.peer === peer) this.closeConnection(connection.id);
+    if (!peer) this.runtime.dispose();
   }
 
   private track(peer: string, incoming: boolean, guard: () => void, context?: TerminalRemoteContext): Connection {

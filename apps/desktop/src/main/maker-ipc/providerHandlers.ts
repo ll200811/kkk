@@ -1,3 +1,10 @@
+import { projectProviderList } from '@cindy/app-runtime/providerViewProjection';
+import { createProviderConfigMutations } from '@cindy/app-runtime/providerConfigMutations';
+import type { ModelContextLimitView } from '@cindy/app-runtime/modelContextHandlers';
+export type { ModelContextLimitView } from '@cindy/app-runtime/modelContextHandlers';
+import { createProviderOwnerGuards } from '@cindy/app-runtime/providerOwnerGuards';
+import { createModelPreferenceTargets, createModelPreferenceQueue } from '@cindy/app-runtime/modelPreferenceTargets';
+import { registerModelContextHandlers } from '@cindy/app-runtime/modelContextHandlers';
 import { appendSpeechModels } from '../../shared/speechProviderSetup.js';
 import { setProviderPresentation, retainProviderPresentationAfterAuthChange } from '../maker-host/provider-presentation-store.js';
 import { pruneProviderGroupBindings } from '../provider-group/bindings.js';
@@ -253,19 +260,6 @@ function oauthRuntimeEndpointSignature(config: CustomProviderConfig | null): str
   }));
 }
 
-/** Never expose runtime header credentials to WebViews or synthetic remote events. */
-function withoutProviderHeaderCredentials(provider: ProviderView): ProviderView {
-  if (!provider.routing) return provider;
-  const routing = Object.fromEntries(
-    Object.entries(provider.routing).map(([agent, descriptor]) => {
-      if (!descriptor) return [agent, descriptor];
-      const safeDescriptor = { ...descriptor };
-      delete safeDescriptor.headerOverride;
-      return [agent, safeDescriptor];
-    }),
-  ) as ProviderView['routing'];
-  return { ...provider, routing };
-}
 
 export interface ProviderHandlerDeps {
   /**
@@ -469,11 +463,7 @@ export interface ProviderHandlerDeps {
 }
 
 /** 上下文上限的读回视图(与写入返回同形，UI 一次拿齐当前值与是否自定义)。 */
-export interface ModelContextLimitView {
-  mixed?: boolean;
-  limit: number | null;
-  isCustomized: boolean;
-}
+
 
 /** 校验 PROVIDER_TEST_CONNECTION 入参形状（确定性代码校验，非法直接 INVALID_PARAMS）。 */
 function parseTestInput(input: unknown): ProviderTestInput | null {
@@ -695,46 +685,7 @@ export function registerProviderHandlers(
       if (owner.providerId === providerId) removeProviderOAuthOwner(ownerId);
     }
   };
-  const providerConfigMutationCounts = new Map<string, number>();
-  const providerConfigMutationTails = new Map<string, Promise<void>>();
-  const beginProviderConfigMutation = (providerId: string): void => {
-    providerConfigMutationCounts.set(
-      providerId,
-      (providerConfigMutationCounts.get(providerId) ?? 0) + 1,
-    );
-  };
-  const finishProviderConfigMutation = (providerId: string): void => {
-    const remaining = (providerConfigMutationCounts.get(providerId) ?? 1) - 1;
-    if (remaining <= 0) providerConfigMutationCounts.delete(providerId);
-    else providerConfigMutationCounts.set(providerId, remaining);
-  };
-  const withProviderConfigMutation = async <T>(
-    providerId: string,
-    operation: (commitRouteMutation: () => void) => Promise<T>,
-  ): Promise<T> => {
-    const finishRouteMutation = deps.beginRouteMutation(providerId);
-    const commitRouteMutation = (): void => finishRouteMutation.commit?.();
-    const previous = providerConfigMutationTails.get(providerId) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.catch(() => undefined).then(() => gate);
-    providerConfigMutationTails.set(providerId, tail);
-    // 排队时即计入 mutation，避免等待前序写入期间启动新的 OAuth flow。
-    beginProviderConfigMutation(providerId);
-    try {
-      await previous.catch(() => undefined);
-      return await operation(commitRouteMutation);
-    } finally {
-      release();
-      if (providerConfigMutationTails.get(providerId) === tail) {
-        providerConfigMutationTails.delete(providerId);
-      }
-      finishProviderConfigMutation(providerId);
-      finishRouteMutation();
-    }
-  };
+  const {withProviderConfigMutation, providerConfigMutationCounts} = createProviderConfigMutations(deps);
   type KeySnapshot = {
     agent: AgentKind;
     previous: string | null | UnrecoverableProviderCredential;
@@ -1031,38 +982,7 @@ export function registerProviderHandlers(
   // Owner-scoped provider reads and writes must stay bound to the account that was active at
   // ingress. Several provider operations cross async boundaries; reject instead of mixing an
   // earlier catalog snapshot with a later owner's preferences or persisting into that owner.
-  const captureProviderOwnerSession = () => deps.currentOwnerSession?.();
-  const providerMutationOwnerMatches = (
-    ownerAtIngress: { dataOwnerId: string | null; generation: number } | undefined,
-  ): boolean => {
-    if (!deps.currentOwnerSession || !ownerAtIngress) return true;
-    const current = deps.currentOwnerSession();
-    return (
-      current.dataOwnerId === ownerAtIngress.dataOwnerId &&
-      current.generation === ownerAtIngress.generation
-    );
-  };
-  const assertProviderMutationOwner = (
-    ownerAtIngress: { dataOwnerId: string | null; generation: number } | undefined,
-    message = 'active account changed during provider mutation',
-  ): void => {
-    if (!providerMutationOwnerMatches(ownerAtIngress)) {
-      throwIpcError('INTERNAL', message);
-    }
-  };
-  const assertRequestedProviderOwner = (
-    requestedDataOwnerId: string | null,
-    requestedOwnerGeneration: number,
-  ): void => {
-    const current = deps.currentOwnerSession?.();
-    if (
-      current &&
-      (current.dataOwnerId !== requestedDataOwnerId ||
-        current.generation !== requestedOwnerGeneration)
-    ) {
-      throwIpcError('INTERNAL', 'active account changed during provider mutation');
-    }
-  };
+  const {captureProviderOwnerSession, providerMutationOwnerMatches, assertProviderMutationOwner, assertRequestedProviderOwner} = createProviderOwnerGuards(deps);
 
   const assertOptionalRequestedOwner = (input: unknown): void => {
     if (input === undefined) return;
@@ -1111,29 +1031,8 @@ export function registerProviderHandlers(
       // Renderer——即使本机主页面 trusted:任何 Renderer 注入(XSS)都能读走这些长期凭证
       // (codex review)。头凭证是 main-only 密文,renderer 从不回读:编辑时未显式改动
       // 请求头,update 由 main 侧保留旧值(planProviderHeaderMutations 'update' 分支)。
-      return {
-        dataOwnerId,
-        ownerGeneration: ownerAtIngress?.generation ?? 0,
-        providers: providers.map((provider) => {
-          const safe = withoutProviderHeaderCredentials(provider);
-          const view = {
-            ...safe,
-            ...(safe.models ? {
-              models: Object.fromEntries(
-                Object.entries(safe.models).map(([agent, models]) => [
-                  agent,
-                  models?.map((model) => ({ ...model, effortsUnknown: model.effortsUnknown === true })),
-                ]),
-              ),
-            } : {}),
-          };
-          return remoteAccess
-            ? { ...view, remoteInvocationEnabled: remoteAccess(provider.id) }
-            : view;
-        }),
-        providerOrder,
-        modelVisibilityOverrides,
-      };
+      return projectProviderList({dataOwnerId,ownerGeneration:ownerAtIngress?.generation ?? 0,
+        providers,providerOrder,modelVisibilityOverrides,remoteAccess});
     },
   );
 
@@ -1662,28 +1561,6 @@ export function registerProviderHandlers(
     return { ok: true, enabled: value.enabled };
   });
 
-  const parsePriceTarget = (value: unknown): ModelPriceOverrideTarget => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throwIpcError('INVALID_PARAMS', 'price override target must be an object');
-    }
-    const target = value as Record<string, unknown>;
-    if (
-      typeof target.providerId !== 'string' ||
-      target.providerId.length === 0 ||
-      target.providerId.length > MAX_DISABLE_ID_LENGTH ||
-      !VALID_AGENTS.includes(String(target.agent)) ||
-      typeof target.modelId !== 'string' ||
-      target.modelId.length === 0 ||
-      target.modelId.length > MAX_DISABLE_ID_LENGTH
-    ) {
-      throwIpcError('INVALID_PARAMS', 'invalid price override target');
-    }
-    return {
-      providerId: target.providerId,
-      agent: target.agent as AgentKind,
-      modelId: target.modelId,
-    };
-  };
   const parseDesiredPrice = (value: unknown): ModelPriceOverrideDesiredQuote => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throwIpcError('INVALID_PARAMS', 'price override quote must be an object');
@@ -1714,27 +1591,8 @@ export function registerProviderHandlers(
         : {}),
     };
   };
-  const requirePriceTargetModel = async (
-    target: ModelPriceOverrideTarget,
-  ): Promise<ProviderView> => {
-    const provider = (await deps.listProviders({ allowSideEffects: false })).find(
-      (candidate) => candidate.id === target.providerId,
-    );
-    const known = provider?.models[target.agent]?.some((model) => model.id === target.modelId);
-    if (!provider || !known) {
-      throwIpcError('INVALID_PARAMS', 'price override target is not in the active catalog');
-    }
-    return provider;
-  };
-  let priceMutationTail: Promise<unknown> = Promise.resolve();
-  const enqueuePriceMutation = <T>(run: () => T | Promise<T>): Promise<T> => {
-    const result = priceMutationTail.catch(() => undefined).then(run);
-    priceMutationTail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  };
+  const {parsePriceTarget, requirePriceTargetModel} = createModelPreferenceTargets(deps);
+  const enqueuePriceMutation = createModelPreferenceQueue();
 
   registry.handle(MAKER_INVOKE.MODEL_PRICE_OVERRIDE_GET, async (event, input: unknown) => {
     assertTrustedProviderMutationSender(event);
@@ -1817,138 +1675,10 @@ export function registerProviderHandlers(
   // ── 单模型上下文上限 ────────────────────────────────────────────────────────
   // 复用价格 override 的 target 解析与写入串行队列:两者都是 (provider, agent, model)
   // 粒度的设置类写入,同一把队列避免两种 override 交错落盘。
-  const parseContextTargets = (input: unknown): ModelPriceOverrideTarget[] => {
-    const target = parsePriceTarget(input);
-    const related = (input as { relatedTargets?: unknown }).relatedTargets;
-    if (related === undefined) return [target];
-    if (!Array.isArray(related) || related.length > 2) {
-      throwIpcError('INVALID_PARAMS', 'invalid related context targets');
-    }
-    const targets = [target, ...related.map(parsePriceTarget)];
-    if (targets.some((t) => t.providerId !== target.providerId) ||
-        new Set(targets.map((t) => t.agent)).size !== targets.length) {
-      throwIpcError('INVALID_PARAMS', 'context targets must name distinct harnesses of one provider');
-    }
-    return targets;
-  };
-  const assertContextOwner = (input: unknown): void => {
-    const owner = input as { dataOwnerId?: unknown; ownerGeneration?: unknown } | null;
-    if (!owner || (owner.dataOwnerId !== null && typeof owner.dataOwnerId !== 'string') ||
-        !Number.isInteger(owner.ownerGeneration) || (owner.ownerGeneration as number) < 0) {
-      throwIpcError('INVALID_PARAMS', 'context mutation requires an owner stamp');
-    }
-    assertRequestedProviderOwner(owner.dataOwnerId as string | null, owner.ownerGeneration as number);
-  };
-  const readContextTargets = (targets: ModelPriceOverrideTarget[]): ModelContextLimitView => {
-    const { read } = requireContextLimitDeps();
-    const views = targets.map(read);
-    return {
-      limit: views.find((v) => v.limit !== null)?.limit ?? null,
-      isCustomized: views.some((v) => v.isCustomized),
-      mixed: views.some((v) => v.limit !== views[0]!.limit),
-    };
-  };
-  const requireContextLimitDeps = (): {
-    read: NonNullable<ProviderHandlerDeps['readModelContextLimit']>;
-    write: NonNullable<ProviderHandlerDeps['writeModelContextLimit']>;
-  } => {
-    if (!deps.readModelContextLimit || !deps.writeModelContextLimit) {
-      throwIpcError('INTERNAL', 'model context limit override is not wired');
-    }
-    return { read: deps.readModelContextLimit, write: deps.writeModelContextLimit };
-  };
-
-  registry.handle(MAKER_INVOKE.MODEL_CONTEXT_LIMIT_GET, async (event, input: unknown) => {
-    assertTrustedProviderMutationSender(event);
-    const targets = parseContextTargets(input);
-    // 读不做目录成员校验:目录漂移后 UI 仍要能显示并清掉指向已下架 id 的陈旧 override。
-    const view = readContextTargets(targets);
-    if (targets.length === 1 && targets[0]!.agent === 'codex') {
-      const sessionId = (input as { sessionId?: unknown }).sessionId;
-      if (sessionId !== undefined && (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.length > 200)) {
-        throwIpcError('INVALID_PARAMS', 'invalid context session id');
-      }
-      return { ...view, codexContext: await deps.readCodexContextWindowInfo?.(targets[0]!, sessionId as string | undefined) ?? null };
-    }
-    return view;
-  });
-
-  registry.handle(
-    MAKER_INVOKE.MODEL_CONTEXT_LIMIT_SET,
-    async (event, targetInput: unknown, limitInput: unknown, ownerInput: unknown) => {
-      assertTrustedProviderMutationSender(event);
-      assertContextOwner(ownerInput);
-      const targets = parseContextTargets(targetInput);
-      const target = targets[0]!;
-      const { write } = requireContextLimitDeps();
-      // null = 恢复默认(删 override)。数值只挡「不是可用 token 数」这一类形状错误;
-      // **不 clamp 到模型窗口** —— 路由把窗口配错时用户得能强行往上填(UI 侧给警示)。
-      if (
-        limitInput !== null &&
-        (typeof limitInput !== 'number' || !Number.isSafeInteger(limitInput) || limitInput < 1_000 || limitInput > 100_000_000)
-      ) {
-        throwIpcError('INVALID_PARAMS', 'context limit must be a positive number or null');
-      }
-      const limit = limitInput as number | null;
-      const ownerAtIngress = captureProviderOwnerSession();
-      return withProviderConfigMutation(target.providerId, () =>
-        enqueuePriceMutation(async () => {
-          // 写入才校验目标在目录里:挡「合法长度但不存在的 id」被批量预埋进这份
-          // 无界 key-value 文件(与停用轴同一条防线)。
-          if (limit !== null) for (const t of targets) await requirePriceTargetModel(t);
-          if (limit !== null) await deps.validateModelContextLimit?.(targets, limit);
-          assertProviderMutationOwner(
-            ownerAtIngress,
-            'active account changed before persisting context limit override',
-          );
-          try {
-            await write(targets, limit);
-          } catch (err) {
-            log.warn('model context limit persist failed', {
-              providerId: target.providerId,
-              agent: target.agent,
-              modelId: target.modelId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            throwIpcError('INTERNAL', 'failed to persist model context limit');
-          }
-          return readContextTargets(targets);
-        }),
-      );
-    },
-  );
-
-  registry.handle(
-    MAKER_INVOKE.MODEL_CONTEXT_LIMIT_RESET,
-    async (event, input: unknown, ownerInput: unknown) => {
-      assertTrustedProviderMutationSender(event);
-      assertContextOwner(ownerInput);
-      const targets = parseContextTargets(input);
-      const target = targets[0]!;
-      const { write } = requireContextLimitDeps();
-      const ownerAtIngress = captureProviderOwnerSession();
-      return withProviderConfigMutation(target.providerId, () =>
-        enqueuePriceMutation(async () => {
-          assertProviderMutationOwner(
-            ownerAtIngress,
-            'active account changed before resetting context limit override',
-          );
-          try {
-            await write(targets, null);
-          } catch (err) {
-            log.warn('model context limit reset failed', {
-              providerId: target.providerId,
-              agent: target.agent,
-              modelId: target.modelId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            throwIpcError('INTERNAL', 'failed to reset model context limit');
-          }
-          return readContextTargets(targets);
-        }),
-      );
-    },
-  );
+  registerModelContextHandlers(registry, deps, {parsePriceTarget, requirePriceTargetModel,
+    captureProviderOwnerSession, providerMutationOwnerMatches, assertProviderMutationOwner,
+    assertRequestedProviderOwner, log, assertTrustedProviderMutationSender, enqueuePriceMutation,
+    withProviderConfigMutation});
 
   // One mutation implementation for manual forms and confirmed secret-bearing imports.
   async function createProviderFromInput(

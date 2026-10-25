@@ -12,6 +12,7 @@ export type TerminalPeerIdentity =
 export interface TerminalRemoteContext {
   readonly source: TerminalPeerIdentity;
   readonly controllerDeviceId: string;
+  readonly controllerCapabilities?: readonly string[];
   readonly sourceDeviceId: string;
   readonly requestId: string;
   readonly ownerScope: string;
@@ -27,6 +28,8 @@ export interface TerminalScopedAuthority {
   allowedChannels: ReadonlySet<string>;
   allowedTopics: ReadonlySet<Topic>;
   allowedPushChannels?: ReadonlySet<string>;
+  /** Last-mile data scope check, including batch contents and private interactions. */
+  acceptsPush?(channel: string, payload: unknown): boolean;
   assertCurrent(): void;
 }
 
@@ -50,16 +53,23 @@ export interface TerminalDeviceServiceOptions {
   authorizationScheme?: DeviceLinkClientOptions['authorizationScheme'];
   invokeLocal(channel: string, args: unknown[], context: TerminalRemoteContext): unknown | Promise<unknown>;
   onPush?(push: TerminalRemotePush): void;
+  onLocalPush?(channel: string, payload: unknown): void;
+  readSharedTaskForProbe?(id: string): Promise<{ sharedTaskId: string; sessionId: string; status: string }>;
+  notificationBody?(kind: 'done' | 'error' | 'needs-reply'): string;
   logger?: DeviceLinkLogger;
   directRuntime?: DirectRuntime;
   transferCodec?: DeviceLinkClientOptions['transferCodec'];
   timing?: DeviceLinkClientOptions['timing'];
   /** Must reflect persisted owner opt-outs immediately. */
   isPeerRevoked?(deviceId: string): boolean;
+  /** Controller preference only; it never revokes the target's inbound access. */
+  isControlTargetDisabled?(peerId: string): boolean;
   resolveScopedAuthority?(source: Exclude<TerminalPeerIdentity, { kind: 'owner' }>): TerminalScopedAuthority | null | Promise<TerminalScopedAuthority | null>;
+  replaySessionActivity?(emit: (payload: import('@cindy/device-link').SessionActivityPayload) => void): void;
   onSubscriptionsChanged?(source: TerminalPeerIdentity, topics: readonly Topic[], context: TerminalRemoteContext): void | Promise<void>;
   /** Release watches/listeners only. No user-data mutation or account reads. */
   onSubscriptionsClosed?(source: TerminalPeerIdentity): void;
+  onPeerClosed?(peer: string, transient: boolean): void;
   /** Extra channels are only for a Host-owned protocol (e.g. encrypted OAuth).
    * Business code must validate that protocol before consuming its payload. */
   extraPushChannels?: ReadonlySet<string>;

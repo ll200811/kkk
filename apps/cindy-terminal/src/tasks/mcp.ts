@@ -1,97 +1,128 @@
-import { randomBytes, randomUUID } from 'node:crypto';
-import http from 'node:http';
-import type { AddressInfo, Socket } from 'node:net';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import {gateBuiltinMcpProviders} from '@cindy/app-runtime/builtinMcpProviderGate';
+import { TASK_CORE_MCP_NAMES } from './mcp-names.js';
+import {pluginIdForKnownProviderName} from '@cindy/app-runtime/builtinPluginIds';
+import type {PluginRegistry} from '@cindy/app-runtime/builtin-tools/plugin-registry';
+import { createRuntimeCapabilityReader } from '@cindy/app-runtime/agentCapabilityCatalog';
+import { randomBytes } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { createSchedulerMcpServer } from '../../../../packages/lizi-mcps/src/cindy_schedulerMcpServer.js';
+import type { SchedulerMcpDeps } from '../../../../packages/lizi-mcps/src/types.js';
 import { createXdtHelperMcpServer, type XdtHelperMcpDeps } from '../../../../packages/lizi-mcps/src/lizi_xdtHelperMcpServer.js';
-import type { AgentKind, McpProvider, PiExtraSpawnConfig } from '@cindy/maker-core';
+import { getLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
+import { startCodexHttpBridge, withMcpRouteIdentity } from '@cindy/mcps/host/codexHttpBridge';
+import type { Session, AgentKind, Logger, McpProvider, McpProviderContext, PiExtraSpawnConfig, PiExtraSpawnConfigContext, CodexMcpThreadContextArgs } from '@cindy/maker-core';
 
-/** Each task owns the server, token and captured context. Closing or changing
- * accounts revokes old tools even if a native child retained its environment. */
-export async function createTaskTools(options: {
-  sessionId: string; workingDir: string; agentKind: AgentKind;
+/** Each task owns the bridge and its credentials. Caller identity comes from
+ * the harness registrations shared with Desktop, never from tool arguments. */
+export type TaskToolsOptions = {
+  sessionId: string; workingDir: string; agentKind: AgentKind; logger: Logger;
+  memoryScopeKey?: string;
+  scheduler?: SchedulerMcpDeps;
+  extraFactories?: Record<string, (context: McpProviderContext) => McpServer>;
+  extraProviders?: McpProvider[];
+  appServerIds?: readonly string[];
+  providerAllowed?(name:string):boolean;
+  pluginRegistry?:PluginRegistry;
+  getVendorOptions?():Record<string,unknown>|undefined;
+  factoryCapabilities?: Record<string, NonNullable<McpProvider['capability']>>;
+  getSession(id: string): Session | undefined;
   helper: XdtHelperMcpDeps; isCurrent(): boolean;
-}) {
-  let closed = false;
-  const assertCurrent = () => { if (closed || !options.isCurrent()) throw new Error('TASK_TOOLS_REVOKED'); };
-  const context = { sessionId: options.sessionId, workingDir: options.workingDir, agentKind: options.agentKind };
-  const factories: Record<string, () => McpServer> = {
-    cindy_helper: () => createXdtHelperMcpServer({ ...options.helper, authorizeCall: async input => {
+};
+export function createTaskToolRegistry(options:TaskToolsOptions) {
+ const assertCurrent=()=>{if(!options.isCurrent())throw new Error('TASK_TOOLS_REVOKED');};
+  const factories: Record<string, (ctx: McpProviderContext) => McpServer> = {
+    [TASK_CORE_MCP_NAMES.helper]: ctx => createXdtHelperMcpServer({ ...options.helper,
+      ...(options.helper.botRoutines?{botRoutines:{...options.helper.botRoutines,scheduler:options.scheduler}}:{}),
+      runtimeCapabilities: createRuntimeCapabilityReader({
+      getSession: id => { assertCurrent(); return options.getSession(id); },
+      catalog: async () => ({ providers }),
+    }), authorizeCall: async input => {
       assertCurrent();
       const result = await options.helper.authorizeCall?.(input);
       if (result && !result.ok) return result;
-      return { ok: true, run: async operation => { assertCurrent(); const value = await operation(); assertCurrent(); return value; } };
-    } }, context),
+      return { ok: true, run: async operation => {
+        const current = async () => { assertCurrent(); const value = await operation(); assertCurrent(); return value; };
+        return result?.run ? result.run(current) : current();
+      } };
+    } }, ctx),
   };
-  const token = randomBytes(32).toString('hex');
-  const envKey = `CINDY_TERMINAL_MCP_${randomBytes(8).toString('hex').toUpperCase()}`;
-  const transports = new Map<string, { name: string; transport: StreamableHTTPServerTransport; server: McpServer }>();
-  const inProcess = new Set<McpServer>();
-  const sockets = new Set<Socket>();
-  const server = http.createServer(async (req, res) => {
-    try {
-      assertCurrent();
-      if (req.socket.remoteAddress !== '127.0.0.1' || req.headers.authorization !== `Bearer ${token}`) { res.writeHead(401).end(); return; }
-      const name = new URL(req.url ?? '/', 'http://localhost').pathname.slice(5);
-      if (!req.url?.startsWith('/mcp/') || !factories[name]) { res.writeHead(404).end(); return; }
-      let body: unknown;
-      if (req.method === 'POST') {
-        const chunks: Buffer[] = []; let size = 0;
-        for await (const chunk of req) {
-          const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-          size += data.length;
-          if (size > 2 * 1024 * 1024) { res.writeHead(413).end(); return; }
-          chunks.push(data);
-        }
-        body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      }
-      assertCurrent();
-      const sessionId = req.headers['mcp-session-id'];
-      if (typeof sessionId === 'string') {
-        const active = transports.get(sessionId);
-        if (!active || active.name !== name) { res.writeHead(404).end(); return; }
-        await active.transport.handleRequest(req, res, body); return;
-      }
-      if (!isInitializeRequest(body)) { res.writeHead(400).end(); return; }
-      if (transports.size >= 16) { res.writeHead(429).end(); return; }
-      const instance = factories[name]();
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, onsessioninitialized: id => { transports.set(id, { name, transport, server: instance }); } });
-      transport.onclose = () => { if (transport.sessionId) transports.delete(transport.sessionId); };
-      await instance.connect(transport);
-      try { await transport.handleRequest(req, res, body); }
-      catch (error) { await instance.close(); throw error; }
-    } catch {
-      if (!res.headersSent) res.writeHead(closed ? 410 : 400);
-      if (!res.writableEnded) res.end();
-    }
+  if (options.scheduler) factories[TASK_CORE_MCP_NAMES.scheduler] = ctx => createSchedulerMcpServer({ ...options.scheduler!, authorizeCall: async input => {
+    assertCurrent(); const result = await options.scheduler!.authorizeCall?.(input);
+    if (result && !result.ok) return result;
+    return { ok: true, run: async operation => {
+      const current = async () => { assertCurrent(); const value = await operation(); assertCurrent(); return value; };
+      return result?.run ? result.run(current) : current();
+    } };
+  } }, ctx);
+  const add = (name: string, factory: (ctx: McpProviderContext) => McpServer) => {
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(name) || Object.hasOwn(factories,name)) throw new Error('INVALID_MCP_FACTORY_NAME');
+    factories[name] = ctx => { assertCurrent(); return factory(ctx); };
+  };
+  for (const [name, factory] of Object.entries(options.extraFactories ?? {})) add(name, factory);
+  for (const provider of options.extraProviders ?? []) add(provider.name, ctx => {
+    const config = provider.toClaudeSdkConfig?.(ctx) as { type?: unknown; instance?: McpServer } | null | undefined;
+    if (!config || config.type !== 'sdk' || !config.instance) throw new Error('MCP_PROVIDER_UNAVAILABLE');
+    return config.instance;
   });
-  server.headersTimeout = 15_000;
-  server.requestTimeout = 30_000;
-  server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
-  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); });
-  const port = (server.address() as AddressInfo).port;
-  const url = (name: string) => `http://127.0.0.1:${port}/mcp/${name}`;
-  const providers: McpProvider[] = Object.keys(factories).map(name => ({
+ for(const name of Object.keys(factories))if(options.providerAllowed?.(name)===false)delete factories[name];
+ const providers:McpProvider[]=Object.keys(factories).map(name=>({
+    ...options.extraProviders?.find(provider => provider.name === name),
     name,
-    capability: { title: name === 'cindy_helper' ? 'Cindy tasks' : 'Cindy documents', description: name === 'cindy_helper' ? 'Read and manage tasks on this computer' : 'Read spreadsheet files in this task', source: 'builtin', ...(name === 'cindy_helper' ? { discovery: { tool: 'list_tools' } } : {}) },
-    toClaudeSdkConfig: () => { assertCurrent(); const instance = factories[name](); inProcess.add(instance); return { type: 'sdk', name, instance }; },
-    toCodexMcpConfig: () => { assertCurrent(); return { type: 'http', url: url(name), bearerTokenEnvVar: envKey }; },
-    getExtraEnv: () => ({ [envKey]: token }),
+    capability: options.extraProviders?.find(provider => provider.name === name)?.capability ?? options.factoryCapabilities?.[name] ?? { title: name === 'cindy_helper' ? 'Cindy tasks' : name === 'cindy_scheduler' ? 'Cindy schedules' : name, description: name === 'cindy_helper' ? 'Read and manage tasks on this computer' : name === 'cindy_scheduler' ? 'Manage scheduled tasks on this computer' : 'Tools for this task', source: 'builtin', ...(name === 'cindy_helper' ? { discovery: { tool: 'list_tools' } } : {}) },
+   toClaudeSdkConfig:ctx=>({type:'sdk',name,instance:factories[name](ctx)}),
+ }));
+ return {factories,providers:options.pluginRegistry?providers.map(provider=>provider.capability?.source==='builtin'&&pluginIdForKnownProviderName(provider.name)?gateBuiltinMcpProviders([provider],options.pluginRegistry!)[0]:provider):providers};
+}
+
+export async function createTaskTools(options: TaskToolsOptions) {
+  let closed = false;
+  const assertCurrent = () => { if (closed || !options.isCurrent()) throw new Error('TASK_TOOLS_REVOKED'); };
+  const assertContext = (ctx: { sessionId?: string }) => { assertCurrent(); if (ctx.sessionId !== options.sessionId) throw new Error('TASK_MCP_SCOPE_MISMATCH'); };
+  const context = { sessionId: options.sessionId, workingDir: options.workingDir, agentKind: options.agentKind, memoryScopeKey: options.memoryScopeKey };
+  const httpContext: McpProviderContext = { agentKind: options.agentKind, workingDir: '', getSessionContext: () => {
+    assertCurrent(); const active = getLiziMcpSessionContext();
+    if (!active || active.sessionId !== options.sessionId || !['claude-code','codex','pi'].includes(active.agentKind)) return undefined;
+    return { ...active, agentKind: active.agentKind as AgentKind, getSessionContext: httpContext.getSessionContext };
+  } };
+  const registry=createTaskToolRegistry({...options,isCurrent:()=>!closed&&options.isCurrent()});
+  const {factories}=registry;
+  const bridge = await startCodexHttpBridge({ logger: options.logger, appServerIds:()=>options.appServerIds??[], serverFactories: Object.fromEntries(Object.entries(factories).map(([name, factory]) => [name, () => factory(httpContext)])) });
+  const envKey = `CINDY_TERMINAL_MCP_${randomBytes(8).toString('hex').toUpperCase()}`;
+  const inProcess = new Set<McpServer>();
+  const providers: McpProvider[] = Object.keys(factories).map(name => ({
+    ...registry.providers.find(provider=>provider.name===name)!,
+    toClaudeSdkConfig: ctx => { assertContext(ctx); const instance = factories[name](ctx); inProcess.add(instance); return { type: 'sdk', name, instance }; },
+    toCodexMcpConfig: ctx => { assertCurrent(); return { type: 'http', url: withMcpRouteIdentity(bridge.url(name), { sessionInstanceId: ctx.sessionInstanceId }), bearerTokenEnvVar: envKey }; },
+    getExtraEnv: () => ({ [envKey]: bridge.token }),
   }));
   return {
     providers,
-    codexArgs: providers.flatMap(provider => ['-c', `mcp_servers.${provider.name}.url=${JSON.stringify(url(provider.name))}`, '-c', `mcp_servers.${provider.name}.bearer_token_env_var=${JSON.stringify(envKey)}`, '-c', `mcp_servers.${provider.name}.tool_timeout_sec=600`]),
-    env: { [envKey]: token },
-    pi: (): PiExtraSpawnConfig => { assertCurrent(); return { mcpBridge: { token, servers: providers.map(provider => ({ name: provider.name, url: url(provider.name) })) } }; },
+    codexArgs: providers.flatMap(provider => ['-c', `mcp_servers.${provider.name}.url=${JSON.stringify(bridge.url(provider.name))}`, '-c', `mcp_servers.${provider.name}.bearer_token_env_var=${JSON.stringify(envKey)}`, '-c', `mcp_servers.${provider.name}.tool_timeout_sec=600`]),
+    env: { [envKey]: bridge.token },
+    buildSessionMcpConfig: (sessionInstanceId: string) => Object.fromEntries(providers.flatMap(provider => [
+      [`mcp_servers.${provider.name}.url`, withMcpRouteIdentity(bridge.url(provider.name), { sessionInstanceId })],
+      [`mcp_servers.${provider.name}.enabled`, provider.isEnabled?.({...context,vendorOptions:options.getVendorOptions?.()})??true],
+    ])),
+    registerCodexMcpThreadContext: (input: CodexMcpThreadContextArgs) => { assertContext(input); bridge.registerThreadContext(input.threadId, { ...input, agentKind: 'codex' }); },
+    unregisterCodexMcpThreadContext: (threadId: string, instanceId?: string) => bridge.unregisterThreadContext(threadId, instanceId),
+    withCodexMcpDiscoveryContext: <T>(input: Pick<CodexMcpThreadContextArgs, 'sessionId' | 'sessionInstanceId' | 'workingDir' | 'vendorOptions' | 'remoteHostId'>, run: () => Promise<T>): Promise<T> => {
+      assertContext(input); return bridge.withDiscoveryContext({ ...input, agentKind: 'codex' }, run);
+    },
+    pi: (input: PiExtraSpawnConfigContext = context): PiExtraSpawnConfig => {
+      assertContext(input);
+      const sessionId = options.sessionId;
+      const ctx: McpProviderContext & {remoteHostId?:string} = { ...context, ...input, remoteHostId: input.remoteHostId ?? undefined, agentKind: input.agentKind ?? options.agentKind };
+      const token = randomBytes(32).toString('hex');
+      bridge.registerSessionCtx(sessionId, ctx);
+      const generation = bridge.registerSessionToken(sessionId, token);
+      return { mcpBridge: { token, servers: providers.filter(provider=>provider.isEnabled?.(ctx)!==false).map(provider => ({ name: provider.name, url: withMcpRouteIdentity(bridge.url(provider.name), input) })) },
+        disposeSessionCtx: () => { bridge.unregisterSessionCtx(sessionId, ctx); bridge.unregisterSessionToken(sessionId, token, generation); } };
+    },
     async close() {
       if (closed) return;
       closed = true;
-      await Promise.all([...transports.values()].map(active => active.server.close().catch(() => undefined)));
       await Promise.all([...inProcess].map(instance => instance.close().catch(() => undefined)));
-      transports.clear(); inProcess.clear();
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>(resolve => server.close(() => resolve()));
+      inProcess.clear(); await bridge.shutdown();
     },
   };
 }

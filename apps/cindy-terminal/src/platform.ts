@@ -1,12 +1,26 @@
+import { RUNTIME_DIRECTORY } from './version.js';
+import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { promises as fs } from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { promises as fs, openSync, writeFileSync, fsyncSync, closeSync, renameSync, rmSync, readFileSync, fstatSync, lstatSync } from 'node:fs';
+import { restrictWindowsDirectory } from './windows-acl.js';
+export { VERSION } from './version.js';
+export const runtimeResourcesDirectory = () => path.join(RUNTIME_DIRECTORY,'resources');
 
-const execFileAsync = promisify(execFile);
-export const VERSION = '0.1.0';
+/** Git Bash ships a different whoami.exe. OS management must not depend on
+ * whichever Unix compatibility utilities appear first in the interactive PATH. */
+export function windowsSystemCommand(name:'whoami'|'schtasks'|'powershell',env:NodeJS.ProcessEnv=process.env):string {
+  const root=env.SystemRoot||env.SYSTEMROOT||env.WINDIR||'C:\\Windows';
+  if(!path.win32.isAbsolute(root)||/[\r\n\0]/.test(root))throw new Error('WINDOWS_SYSTEM_ROOT_INVALID');
+  return path.win32.join(root,'System32',name==='powershell'?'WindowsPowerShell\\v1.0\\powershell.exe':`${name}.exe`);
+}
+
+/** Windows PowerShell 5 must rebuild its own module search path. Inheriting
+ * PowerShell 7's PSModulePath can load incompatible Security module assemblies. */
+export function windowsPowerShellEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => key.toLowerCase() !== 'psmodulepath'));
+}
 
 /** Kept outside the profile so a stopped-profile restore can swap directories
  * without dropping the same lock used by daemon startup. */
@@ -44,20 +58,7 @@ export async function privateDirectory(directory: string): Promise<void> {
     await fs.chmod(directory, 0o700);
     return;
   }
-  // Construct a new DACL: removing inheritance alone leaves old explicit grants.
-  // The path is data, never interpolated into PowerShell source.
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    '$owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User',
-    '$acl = New-Object System.Security.AccessControl.DirectorySecurity',
-    '$acl.SetAccessRuleProtection($true, $false)',
-    '$acl.SetOwner($owner)',
-    'foreach ($sid in @($owner, (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")))) { $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"); $acl.AddAccessRule($rule) }',
-    'Set-Acl -LiteralPath $env:CINDY_PRIVATE_DIRECTORY -AclObject $acl',
-  ].join('; ');
-  await execFileAsync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
-    windowsHide: true, timeout: 15_000, env: { ...process.env, CINDY_PRIVATE_DIRECTORY: directory },
-  });
+  await restrictWindowsDirectory(path.resolve(directory), windowsSystemCommand('powershell'), windowsPowerShellEnv());
 }
 
 export async function readPrivateFile(file: string): Promise<Buffer | null> {
@@ -90,4 +91,38 @@ export async function atomicPrivateWrite(file: string, data: string | Buffer): P
     }
   }
   finally { await fs.rm(temp, { force: true }); }
+}
+
+/** Synchronous counterpart for shared registries whose read-modify-write is
+ * already protected by a cross-process lock. Same private-file read boundary. */
+export function readPrivateFileSync(file: string): Buffer | null {
+  try {
+    const handle = openSync(file, 'r');
+    try {
+      const stat = fstatSync(handle), link = lstatSync(file);
+      if (!stat.isFile() || link.isSymbolicLink() || link.ino !== stat.ino) throw new Error('UNSAFE_PRIVATE_FILE');
+      if (process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)) throw new Error('PRIVATE_FILE_PERMISSIONS');
+      if (stat.size > 16 * 1024 * 1024) throw new Error('PRIVATE_FILE_TOO_LARGE');
+      return readFileSync(handle);
+    } finally { closeSync(handle); }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/** Synchronous transaction boundary for the shared plugin credential managers.
+ * Same private-file and durable rename contract as atomicPrivateWrite. */
+export function atomicPrivateWriteSync(file: string, data: string | Buffer): void {
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  const handle = openSync(temp, 'wx', 0o600);
+  try {
+    try { writeFileSync(handle, data); fsyncSync(handle); }
+    finally { closeSync(handle); }
+    renameSync(temp, file);
+    if (process.platform !== 'win32') {
+      const directory = openSync(path.dirname(file), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
+  } finally { rmSync(temp, { force: true }); }
 }

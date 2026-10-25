@@ -37,6 +37,7 @@ vi.mock('electron', () => ({
 vi.mock('../../appSessionState', () => ({
   getActiveAppSession: () => ({ mode: 'cloud', dataOwnerId: 'cache-owner' }),
   activeOwnerScopeKey: () => 'cache-owner:0',
+  dataOwnerStorageKey: () => 'cache-owner',
 }));
 vi.mock('../mediaTransfer', () => ({ removeRemote: vi.fn() }));
 vi.mock('../mediaFetch', () => ({ resolveAuthorizedMedia: mock.resolve }));
@@ -87,6 +88,36 @@ import {
 import { readRemoteDeviceFile } from '../fileAccess';
 import { DesktopCaptureWindow } from '../../remote-desktop/captureWindow';
 import { createHash } from 'node:crypto';
+import { createTerminalFilePeerRuntime } from '../../remote-desktop/terminalFilePeerRuntime';
+import { FILE_PEER_RECEIVE_TIMEOUT_MS } from '@cindy/device-link';
+
+// The optional graphical host must use the same files renderer without turning
+// a progressing transfer into a total-duration timeout, or retaining its sink
+// after the authenticated owner closes it. tier: unit; native SDP/bytes have a
+// separate real-device acceptance path.
+it('keeps a terminal file receive alive only on authorized progress and retires its sink on reset', async () => {
+  vi.useFakeTimers();
+  const write = vi.fn(async () => {});
+  const closed = vi.fn();
+  const runtime = createTerminalFilePeerRuntime({ read: vi.fn(), write, closed });
+  const connection = '0c0e9773-2d02-4ae9-a1bb-747ddad65b75';
+  const sink = 'f4999f92-66de-45f9-8cc5-4331ed6b6ea2';
+  try {
+    await runtime.offer(connection, [], true);
+    const receiving = runtime.receive(connection, '466ad091-37fc-4994-90af-01fa880bc4da', 4, sink);
+    const outcome = expect(receiving).rejects.toThrow('FILE_PEER_UNAVAILABLE');
+    await vi.advanceTimersByTimeAsync(FILE_PEER_RECEIVE_TIMEOUT_MS - 1);
+    await mock.handlers.get('file-peer:host:write')!({}, sink, 0, 'YWJjZA==');
+    await vi.advanceTimersByTimeAsync(2);
+    expect(closed).not.toHaveBeenCalled();
+    expect(write).toHaveBeenCalledWith(sink, 0, 'YWJjZA==');
+    runtime.dispose();
+    await outcome;
+    await expect(mock.handlers.get('file-peer:host:write')!({}, sink, 4, '')).rejects.toThrow('FILE_PEER_UNAVAILABLE');
+    expect(closed).toHaveBeenCalledWith(connection);
+    expect(write).toHaveBeenCalledTimes(1);
+  } finally { runtime.dispose(); vi.useRealTimers(); }
+});
 
 describe('peer attachment upload preflight', () => {
   it('checks the peer before reading a large file and never connects to an old peer', async () => {

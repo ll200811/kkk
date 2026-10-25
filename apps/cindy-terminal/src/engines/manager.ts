@@ -1,3 +1,4 @@
+import { publishEngineDirectory } from './publish.js';
 import { createReadStream, createWriteStream, constants } from 'node:fs';
 import { access, chmod, lstat, mkdir, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -86,28 +87,58 @@ export class EngineManager {
     const home = path.join(this.root, kind);
     await privateDirectory(this.root); await privateDirectory(home);
     const id = `${release.version}-${randomUUID()}`;
+    const destination = path.join(home, id);
     const staging = path.join(home, `.install-${randomUUID()}`);
     await privateDirectory(staging);
     const archive = path.join(staging, 'download');
     const files = path.join(staging, 'files');
     await mkdir(files, { mode: 0o700 });
+    let stage = 'download';
+    let published = false, activated = false;
     try {
       await this.download(kind, asset, archive, signal);
+      stage = 'extract';
       this.options.onProgress?.({ kind, stage: 'extract' });
       if (asset.format === 'raw') { await rename(archive, path.join(files, asset.entrypoint)); }
       else await extractEngineArchive(archive, files, asset.format);
       signal?.throwIfAborted();
+      stage = 'layout';
       const root = await this.layout(kind, files, asset, release.version);
       const binary = path.join(root, asset.entrypoint);
       if (process.platform !== 'win32') await chmod(binary, 0o700);
-      // Validate the actual executable before making it active. Never inspect auth.
-      const reported = await runNative(binary, ['--version'], { signal, timeout: 30_000 });
+      // Move before executing: Windows may keep the executable mapped after
+      // --version closes. Only current.json activates this unique directory.
+      stage = 'publish';
+      await publishEngineDirectory(root, destination, signal);
+      published = true;
+      signal?.throwIfAborted();
+      // Validate at the final path, including any relative runtime resources.
+      // Never inspect auth, and leave the old receipt active until this passes.
+      stage = 'version';
+      const reported = await runNative(path.join(destination, asset.entrypoint), ['--version'], { signal, timeout: 30_000 });
       if (reported.code !== 0 || !reported.stdout.includes(release.version)) throw new EngineError('engine_version_mismatch');
-      await rename(root, path.join(home, id));
+      signal?.throwIfAborted();
+      stage = 'receipt';
       await atomicPrivateWrite(path.join(home, 'current.json'), JSON.stringify({ version: release.version, directory: id, entrypoint: asset.entrypoint, sha256: asset.sha256, asset } satisfies Receipt));
+      activated = true;
       this.options.onProgress?.({ kind, stage: 'ready' });
       return this.status(kind);
-    } finally { await rm(staging, { recursive: true, force: true }); }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code && /^E[A-Z]+$/.test(code)) throw new EngineError(`engine_${stage}_${code.toLowerCase()}`);
+      throw error;
+    } finally {
+      // Keep candidates once receipt publication starts: an fsync error can
+      // follow a successful rename. Removing that directory would break the
+      // now-active receipt. Earlier failures are never selectable.
+      if (published && !activated && stage !== 'receipt') await rm(destination, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => {});
+      // Defender can briefly retain handles even after our own streams close.
+      // Node's bounded retry applies only to its documented transient rm errors.
+      await rm(staging, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(error => {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        throw new EngineError(`engine_cleanup_${code && /^E[A-Z]+$/.test(code) ? code.toLowerCase() : 'failed'}`);
+      });
+    }
   }
 
   private async download(kind: EngineKind, asset: EngineAsset, output: string, signal?: AbortSignal): Promise<void> {
@@ -133,7 +164,8 @@ export class EngineManager {
       root = path.join(files, entries[0]!.name);
     }
     const required = [asset.entrypoint];
-    if (kind === 'pi') required.push('theme/dark.json', 'theme/light.json', 'theme/theme-schema.json');
+    // Pi 1.4 distributes the runtime themes without the development JSON schema.
+    if (kind === 'pi') required.push('theme/dark.json', 'theme/light.json');
     if (kind === 'codex') {
       required.push('codex-package.json', `bin/codex-code-mode-host${process.platform === 'win32' ? '.exe' : ''}`, `codex-path/rg${process.platform === 'win32' ? '.exe' : ''}`);
       const manifest = JSON.parse(await readFile(path.join(root, 'codex-package.json'), 'utf8'));

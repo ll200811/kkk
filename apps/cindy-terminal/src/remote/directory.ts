@@ -13,7 +13,7 @@ export function readDeviceDirectory(value: unknown): DeviceView[] {
     throw new TerminalRemoteError('INVALID_RESPONSE', 'Invalid device directory');
   }
   return value.devices.map((device): DeviceView => {
-    if (!record(device) || !text(device.deviceId, 128) || !text(device.name, 1024)
+    if (!record(device) || !text(device.deviceId, 128) || typeof device.name !== 'string' || device.name.length > 1024
       || (device.platform !== null && !text(device.platform, 64))
       || (device.appVersion !== null && !text(device.appVersion, 128))
       || typeof device.online !== 'boolean' || typeof device.remoteControlEnabled !== 'boolean'

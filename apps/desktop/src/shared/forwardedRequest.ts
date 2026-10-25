@@ -14,28 +14,10 @@ const FORWARDED_REQUEST_COPY = {
   ko: ko.forwardedRequest,
 } satisfies Record<SupportedLocale, typeof en.forwardedRequest>;
 
-/** Host-owned source evidence. It describes authorship, never execution permission. */
-export interface ForwardedRequestSource {
-  userText: string | null;
-  sessionId?: string;
-  clientId?: string;
-}
+import type { ForwardedRequestSource, AgentRequestReceipt } from '@cindy/maker-shared/forwarded-request-types';
+export type { ForwardedRequestSource, AgentRequestReceipt } from '@cindy/maker-shared/forwarded-request-types';
 
-/** Kept under the existing protected, non-human input receipt. */
-export interface AgentRequestReceipt {
-  kind: 'agent-request' | 'delegated-continuation';
-  request?: ForwardedRequestSource;
-}
-
-export function readForwardedRequestSource(value: unknown): ForwardedRequestSource | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const source = value as Record<string, unknown>;
-  if (source.userText === null) return { userText: null };
-  if (typeof source.userText !== 'string' || typeof source.sessionId !== 'string'
-    || !source.sessionId || typeof source.clientId !== 'string' || !source.clientId) return null;
-  return { userText: source.userText, sessionId: source.sessionId, clientId: source.clientId };
-}
-
+export {readForwardedRequestSource} from '@cindy/maker-shared/forwarded-request-types';
 /** JSON string quoting keeps an agent-written label inside the supplement. No trimming or summarizing. */
 export function formatForwardedRequest(source: ForwardedRequestSource, supplement: string, locale: SupportedLocale = DEFAULT_LOCALE): string {
   const copy = FORWARDED_REQUEST_COPY[locale];
@@ -74,4 +56,4 @@ export function matchesForwardedRequest(source: ForwardedRequestSource, body: st
 }
 
 /** Main-process persistence capability: JSON / IPC cannot mint this key. */
-export const FORWARDED_REQUEST_RECEIPT = Symbol('forwarded-request-receipt');
+export { FORWARDED_REQUEST_RECEIPT } from '@cindy/maker-shared/forwarded-request-types';

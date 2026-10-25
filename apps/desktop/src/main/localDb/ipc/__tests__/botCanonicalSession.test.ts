@@ -50,6 +50,10 @@ import {
   sessions,
 } from '../../schema';
 
+// The account module imports the app updater; updater/GUI startup is outside
+// this database integration fixture (the pre-refactor file fails on that graph too).
+vi.mock('../../../updateService', () => ({readReloginFlag: () => null, clearReloginFlag: vi.fn(), enableUncustomizedBetaChannel: vi.fn()}));
+
 // Host preference storage is outside this database/runtime integration test.
 vi.mock('electron-store', () => ({ default: class {
   private values = new Map<string, unknown>();
@@ -127,6 +131,7 @@ vi.mock('../../../maker-ipc/botDefaultProvisioning.js', () => ({
   },
 }));
 vi.mock('electron', () => ({
+  shell: {openExternal: vi.fn(async () => {throw new Error('Unexpected external navigation in bot DB fixture');})},
   app: {
     getPath: vi.fn(() => h.userDataDir),
     getAppPath: () => resolve(__dirname, '../../../../..'),
@@ -2278,6 +2283,10 @@ describe('Bot canonical Session lifecycle', () => {
   // memory/Skill index. Exercise hydrate + persisted applied snapshots, not hash
   // implementation details; the minimal mutation keeps Profile and paths fixed.
   it.each(['canonical', 'channel', 'thread'])('refreshes shared learned resources in a running %s chat', async role => {
+    // Multiple profile snapshots can be prepared within one millisecond. The
+    // latest committed snapshot must win even when their timestamps tie.
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
+    try {
     const created = await invoke('local-db:bots:create-canonical-session', {
       botId: 'bot-1', expectedCanonicalSessionId: null, expectedProfileVersion: 1,
     });
@@ -2304,6 +2313,7 @@ describe('Bot canonical Session lifecycle', () => {
     expect((await hydrateBotProfileRuntime(makeOpts(), deps))?.runtimeEpochChanged).toBe(false);
     updatedAt = 'v2';
     expect((await hydrateBotProfileRuntime(makeOpts(), deps))?.runtimeEpochChanged).toBe(true);
+    } finally { clock.mockRestore(); }
   });
 
   it('refreshes canonical Skill resources in place when their fingerprint changes', async () => {

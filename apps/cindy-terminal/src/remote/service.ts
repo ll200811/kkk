@@ -1,13 +1,20 @@
+import { CONTROLLER_CAPABILITY_SET_MODEL_EXPLICIT_PROVIDER_NULL_V1 } from '@cindy/device-link';
 import { createHash } from 'node:crypto';
+import { assertBackgroundLinkAccepted } from '@cindy/app-runtime/backgroundLink';
+import { createTransportTimeoutReopenLoop, shouldAbortTransportTimeoutReopen } from '@cindy/app-runtime/transportTimeoutReopen';
+import { createResponsivenessTracker, isDeviceResponsivenessProbeEligible, OPEN_LINK_OBSERVATION_CHANNEL } from '@cindy/app-runtime/responsivenessTracker';
+import { invokeWithClosedLinkRecovery } from '@cindy/app-runtime/linkRecovery';
+import { DEVICE_LINK_PUSH } from '@cindy/remote-agent/shared/deviceLinkIpc';
+import { createMobileNotificationSender } from '@cindy/app-runtime/mobileNotificationSender';
 import {
   DeviceLinkClient, DeviceLinkError, PROTOCOL_VERSION, REMOTE_INVOKE_ALLOWLIST,
   PUSH_FORWARD_ALLOWLIST, DL_SUBSCRIBE_CHANNEL, DL_UNSUBSCRIBE_CHANNEL,
   DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1,
   DEVICE_LINK_CAPABILITY_TRANSPORT_TIMEOUT_CLOSE,
   CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1, MAKER_EVENT_BATCH_CHANNEL,
-  computeAllowlistHash, expandMakerEventBatchPayload, isPeerResetRetryableInvoke,
+  computeAllowlistHash, expandMakerEventBatchPayload, probeSharedTaskHost,
   parseProviderSharePeer, parseSharedTaskPeer, resolveRemoteInvokeTimeoutMs,
-  topicForPush,
+  topicForPush, SESSION_ACTIVITY_CHANNEL,
   type DeviceLinkStatus, type DeviceView, type Envelope, type InvokePayload, type InvokeResultPayload,
   type LinkAcceptPayload, type LinkOpenPayload, type PresenceSnapshot, type PushOwnerStamp,
   type Topic,
@@ -19,11 +26,10 @@ import {
 } from './types.js';
 
 type Guard = () => void;
-type Inbound = { source: TerminalPeerIdentity; topics: Set<Topic>; legacy: boolean; active: boolean; modern: boolean };
+type Inbound = { controllerCapabilities: readonly string[]; source: TerminalPeerIdentity; topics: Set<Topic>; legacy: boolean; active: boolean; modern: boolean };
 type Outbound = {
   id: string; topics: Map<Topic, number>; wanted: boolean; revision: number;
   opening?: Promise<LinkAcceptPayload>; accepted?: LinkAcceptPayload;
-  retry?: ReturnType<typeof setTimeout>; attempts: number;
 };
 type Invocation = {
   fingerprint: string;
@@ -36,6 +42,7 @@ const MAX_INBOUND = 128;
 const MAX_COMPLETED = 4096;
 const MAX_REPLY_BYTES = 32 * 1024 * 1024;
 const REPLY_TTL_MS = 15 * 60_000;
+const SHARED_TASK_METADATA = new Set(['local-db:sessions:created', 'local-db:sessions:patched', 'local-db:sessions:activity', 'local-db:session:error-persisted', 'usage:session-spend-changed', 'usage:session-tokens-changed']);
 const record = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 
@@ -83,6 +90,7 @@ function failed(error: unknown): InvokeResultPayload {
  * Closing a UI subscription never terminates the runtime or a task. */
 export class TerminalDeviceService {
   readonly client: DeviceLinkClient;
+  readonly notifications: ReturnType<typeof createMobileNotificationSender>;
   private running = false;
   private generation = 0;
   private ownerScope: string | null = null;
@@ -93,6 +101,12 @@ export class TerminalDeviceService {
   private readonly presence = new Map<string, PresenceSnapshot>();
   private readonly statusListeners = new Set<(status: DeviceLinkStatus) => void>();
   private readonly presenceListeners = new Set<(device: PresenceSnapshot) => void>();
+  private directoryReader?: () => Promise<DeviceView[]>;
+  private readonly recovery;
+  private readonly responsiveness;
+  private readonly pendingOutbound = new Map<string, Set<symbol>>();
+  private readonly revokedByRemote = new Set<string>();
+  private probeTimer?: ReturnType<typeof setInterval>;
 
   constructor(private readonly options: TerminalDeviceServiceOptions) {
     this.client = new DeviceLinkClient({
@@ -108,6 +122,51 @@ export class TerminalDeviceService {
       directRuntime: options.directRuntime, transferCodec: options.transferCodec,
       timing: options.timing, peerResetReadRetry: true,
     });
+    this.notifications = createMobileNotificationSender({
+      getClient: () => this.current() ? this.client : null, getGeneration: () => this.generation,
+      getControllersForTopic: topic => [...this.inbound.values()].filter(entry => entry.active && entry.source.kind === 'owner' && entry.topics.has(topic as Topic)),
+      getSessionNotificationBody: kind => options.notificationBody?.(kind) ?? kind,
+      log: { debug: message => options.logger?.debug(message) },
+    });
+    this.recovery = createTransportTimeoutReopenLoop({
+      shouldAbort: id => shouldAbortTransportTimeoutReopen({ clientOnline: this.client.getStatus() === 'online', isOwner: this.current(),
+        controlDisabledLocally: options.isControlTargetDisabled?.(id) === true || this.revokedByRemote.has(id),
+        hasOutboundControlIntent: this.outbound.get(id)?.wanted === true && (Boolean(this.outbound.get(id)?.topics.size) || Boolean(this.pendingOutbound.get(id)?.size)) }),
+      reopen: id => this.connect(id),
+      onReset: deviceId => options.onLocalPush?.(DEVICE_LINK_PUSH.PEER_LINK_RESET, { deviceId }),
+      onReopened: deviceId => options.onLocalPush?.(DEVICE_LINK_PUSH.PEER_LINK_REOPENED, { deviceId }),
+      log: { info: message => options.logger?.info(message), warn: message => options.logger?.warn(message) },
+    });
+    this.responsiveness = createResponsivenessTracker({
+      probeInvoke: async (id, channel, args) => {
+        const check = this.guard();
+        const target = this.outbound.get(id), revision = target?.revision;
+        const current = () => { check();
+          if (this.revokedByRemote.has(id) || options.isControlTargetDisabled?.(id)) throw new DeviceLinkError('ACCESS_REVOKED', 'Device probe access changed');
+          if (this.outbound.get(id) !== target || target?.revision !== revision) throw new DeviceLinkError('NOT_CONNECTED', 'Device probe superseded');
+        };
+        const open = async () => { current(); await this.connect(id, { observed: false, replaySubscriptions: false }); current(); };
+        const invoke = (probeChannel: string, probeArgs: unknown[]) => { current(); return this.client.invoke(id, { channel: probeChannel, args: probeArgs }, resolveRemoteInvokeTimeoutMs(probeChannel, probeArgs), { preSend: current }); };
+        if (parseSharedTaskPeer(id)) return probeSharedTaskHost(id, {
+          isCurrent: () => { try { current(); return true; } catch { return false; } },
+          get: async task => { if (!options.readSharedTaskForProbe) throw new DeviceLinkError('ACCESS_REVOKED', 'Shared task unavailable'); return options.readSharedTaskForProbe(task); },
+          openLink: open, invoke,
+        });
+        await open(); return invoke(channel, args);
+      },
+      isProbeEligible: id => isDeviceResponsivenessProbeEligible({ relayOnline: this.client.getStatus() === 'online', ownsRelay: this.current(),
+        presenceAvailable: this.presence.get(identity(id).deviceId)?.online, revoked: this.revokedByRemote.has(id), locallyDisabled: options.isControlTargetDisabled?.(id) === true }),
+      recoverLink: async id => {
+        if (this.revokedByRemote.has(id) || options.isControlTargetDisabled?.(id)) throw new DeviceLinkError('ACCESS_REVOKED', 'Device recovery access changed');
+        const entry = this.outbound.get(id); if (entry) entry.accepted = undefined;
+        return this.connect(id, { observed: false, replaySubscriptions: false });
+      },
+      onUnresponsiveChanged: (deviceId, unresponsive, recovered) => {
+        options.onLocalPush?.(DEVICE_LINK_PUSH.RESPONSIVENESS_CHANGED, { deviceId, unresponsive, recovered });
+        const entry = this.outbound.get(deviceId);
+        if (recovered && this.current() && entry?.wanted) { entry.accepted = undefined; this.scheduleRecovery(entry); }
+      },
+    });
     this.client.onFrame((envelope) => {
       // Register the request synchronously before yielding, then return so a slow
       // business operation cannot block transport ACKs, stop, or steering.
@@ -118,10 +177,11 @@ export class TerminalDeviceService {
     });
     this.client.onStatusChange((status) => {
       if (status !== 'online') {
+        this.recovery.dispose();
         for (const entry of this.inbound.values()) entry.active = false;
         for (const entry of this.outbound.values()) entry.accepted = undefined;
       } else if (this.current()) {
-        for (const entry of this.outbound.values()) if (entry.wanted) this.scheduleRecovery(entry, 0);
+        for (const entry of this.outbound.values()) if (entry.wanted) this.scheduleRecovery(entry);
       }
       for (const listener of this.statusListeners) {
         try { listener(status); } catch { options.logger?.warn('Remote observer failed'); }
@@ -130,20 +190,26 @@ export class TerminalDeviceService {
     this.client.onPresenceChanged((snapshot) => {
       if (!this.current()) return;
       this.presence.set(snapshot.deviceId, snapshot);
+      if (!snapshot.online) this.responsiveness.clearDevice(snapshot.deviceId);
       for (const listener of this.presenceListeners) {
         try { listener(snapshot); } catch { options.logger?.warn('Remote observer failed'); }
       }
       const entry = this.outbound.get(snapshot.deviceId);
-      if (snapshot.online && entry?.wanted) this.scheduleRecovery(entry, 0);
+      // Presence loss can mean the remote process exited. Its old handshake is
+      // no longer evidence that the next process knows our reliable stream or
+      // subscriptions. Keep recovery intent and the shared relay intact; the
+      // existing link-open handshake reconciles transport state on return.
+      if (!snapshot.online && entry) entry.accepted = undefined;
+      if (snapshot.online && entry?.wanted) this.scheduleRecovery(entry);
     });
     this.client.onPeerTransportReset(({ deviceId }) => {
       const entry = this.outbound.get(deviceId);
-      if (entry?.wanted) this.scheduleRecovery(entry, 0);
+      if (entry?.wanted) this.scheduleRecovery(entry);
     });
     this.client.onReliableFrameBeforeLink((peer) => {
       const entry = this.outbound.get(peer);
       if (!entry?.wanted) return false;
-      this.scheduleRecovery(entry, 0);
+      this.scheduleRecovery(entry);
       return true;
     });
   }
@@ -156,6 +222,8 @@ export class TerminalDeviceService {
     this.running = true;
     this.generation++;
     this.client.start();
+    this.probeTimer = setInterval(() => { if (this.current()) this.responsiveness.probeTick(); }, 5_000);
+    this.probeTimer.unref();
   }
 
   stop(): void {
@@ -165,14 +233,16 @@ export class TerminalDeviceService {
     this.running = false;
     this.generation++;
     for (const invocation of this.invocations.values()) invocation.abort.abort();
-    for (const entry of this.outbound.values()) clearTimeout(entry.retry);
-    for (const entry of this.inbound.values()) this.closeSubscriptionResources(entry.source);
+    clearInterval(this.probeTimer); this.recovery.dispose(); this.responsiveness.resetAll();
+    this.pendingOutbound.clear(); this.revokedByRemote.clear();
+    for (const entry of this.inbound.values()) { this.peerClosed(entry.source.peerId, false); this.closeSubscriptionResources(entry.source); }
     this.inbound.clear(); this.outbound.clear(); this.invocations.clear(); this.presence.clear(); this.subscriptionQueues.clear();
     this.client.stop();
     this.ownerScope = null;
   }
 
   getStatus(): DeviceLinkStatus { return this.client.getStatus(); }
+  getNotificationGeneration(): number { return this.generation; }
   getSelfDeviceId(): string | null { return this.current() ? this.client.getSelfDeviceId() : null; }
   getConnectionIssue() { return this.client.getConnectionIssue(); }
   onStatusChange(listener: (status: DeviceLinkStatus) => void): () => void {
@@ -183,24 +253,34 @@ export class TerminalDeviceService {
   }
   notifyNetworkChanged(): void { if (this.current()) this.client.notifyNetworkChanged({ urgent: true }); }
   refreshPresence(): void { this.guard()(); this.client.sendPresence(this.options.getHello()); }
+  configureDirectoryReader(read: () => Promise<DeviceView[]>) { this.directoryReader = read; }
+  directoryPresence() { return this.presence; }
+  directoryPeerAvailable(id: string) {
+    const entry = this.outbound.get(id);
+    if (entry?.wanted) this.scheduleRecovery(entry);
+  }
+  getUnresponsiveDeviceIds() { return this.responsiveness.getUnresponsiveDeviceIds(); }
+  clearDeviceResponsiveness(id: string) { this.responsiveness.clearDevice(id); }
+  activeControllers() {
+    return [...this.inbound.values()].filter(entry => entry.active && entry.source.kind === 'owner' && (entry.legacy || entry.topics.size > 0))
+      .map(entry => ({ deviceId: entry.source.deviceId, name: this.presence.get(entry.source.deviceId)?.deviceName || entry.source.deviceId.slice(0, 8) }));
+  }
+  disconnectControllers() {
+    for (const entry of [...this.inbound.values()]) if (entry.source.kind === 'owner') this.revoke(entry.source.peerId, 'user');
+  }
+
+  async sourceDevice(deviceId:string):Promise<import('@cindy/maker-shared/message-source').MessageSourceDevice|undefined> {
+    const check=this.guard();check();
+    if(!this.presence.has(deviceId))await this.listDevices().catch(()=>undefined);
+    check();const device=this.presence.get(deviceId);if(!device)return;
+    const platform=['ios','android','mobile'].includes(device.platform.toLowerCase())?'mobile':['darwin','macos','windows','win32','linux','desktop'].includes(device.platform.toLowerCase())?'desktop':undefined;
+    if(!platform)return;
+    return {deviceId,platform,...(device.deviceName?{name:device.deviceName}:{})};
+  }
 
   async listDevices(): Promise<DeviceView[]> {
-    const check = this.guard(); check();
-    if (this.options.authorizationScheme === 'ProviderShareGuest') {
-      throw new TerminalRemoteError('CHANNEL_NOT_ALLOWED', 'Shared-provider credentials cannot list account devices');
-    }
-    const endpoint = new URL(this.options.getDevicesUrl?.() ?? directoryUrl(this.options.getWsUrl()));
-    if (!['https:', 'http:'].includes(endpoint.protocol) || endpoint.username || endpoint.password) {
-      throw new TerminalRemoteError('INVALID_ENDPOINT', 'Invalid device directory endpoint');
-    }
-    const token = await this.options.getToken(); check();
-    if (!token) throw new TerminalRemoteError('AUTH_REQUIRED', 'Sign in to list devices');
-    const response = await (this.options.fetch ?? fetch)(endpoint, {
-      headers: { authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(15_000),
-    });
-    check();
-    if (!response.ok) throw new TerminalRemoteError(response.status === 401 ? 'AUTH_REQUIRED' : 'DIRECTORY_UNAVAILABLE', 'Device directory unavailable');
-    const devices = readDeviceDirectory(await response.json()); check();
+    if (this.directoryReader) return this.directoryReader();
+    const devices = readDeviceDirectory(await this.requestDevicesApi('/api/device-link/devices'));
     this.presence.clear();
     for (const device of devices) this.presence.set(device.deviceId, {
       ...device, deviceName: device.name, platform: device.platform ?? '', appVersion: device.appVersion ?? '',
@@ -209,13 +289,39 @@ export class TerminalDeviceService {
     return devices;
   }
 
-  async connect(peerId: string): Promise<LinkAcceptPayload> {
+  /** Same authenticated management endpoint as Desktop, fenced to this owner. */
+  async requestDevicesApi<T>(route: string, options?: { method?: string; body?: unknown }): Promise<T> {
+    const check = this.guard(); check();
+    if (this.options.authorizationScheme === 'ProviderShareGuest') {
+      throw new TerminalRemoteError('CHANNEL_NOT_ALLOWED', 'Shared-provider credentials cannot list account devices');
+    }
+    const endpoint = new URL(this.options.getDevicesUrl?.() ?? directoryUrl(this.options.getWsUrl()));
+    if (!/^\/api\/device-link\/devices(?:\/[^/?#]+)?$/.test(route)) throw new TerminalRemoteError('INVALID_PARAMS', 'Invalid device management request');
+    endpoint.pathname += route.slice('/api/device-link/devices'.length);
+    if (!['https:', 'http:'].includes(endpoint.protocol) || endpoint.username || endpoint.password) {
+      throw new TerminalRemoteError('INVALID_ENDPOINT', 'Invalid device directory endpoint');
+    }
+    const token = await this.options.getToken(); check();
+    if (!token) throw new TerminalRemoteError('AUTH_REQUIRED', 'Sign in to list devices');
+    const response = await (this.options.fetch ?? fetch)(endpoint, {
+      method: options?.method ?? 'GET',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      ...(options?.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+      redirect: 'error', signal: AbortSignal.timeout(15_000),
+    });
+    check();
+    if (!response.ok) throw new TerminalRemoteError(({ 401: 'AUTH_REQUIRED', 404: 'NOT_FOUND', 409: 'ALREADY_EXISTS', 400: 'INVALID_PARAMS' } as Record<number, string>)[response.status] ?? 'DEVICE_LINK_UNAVAILABLE', 'Device management request failed');
+    const value = await response.json() as T; check(); return value;
+  }
+
+  async connect(peerId: string, options?: { observed?: boolean; replaySubscriptions?: boolean }): Promise<LinkAcceptPayload> {
     identity(peerId);
     const check = this.guard(); check();
+    if (this.options.isControlTargetDisabled?.(peerId)) throw new TerminalRemoteError('DEVICE_LINK_CONTROL_DISABLED', 'Device control is disabled locally');
     if (peerId === this.client.getSelfDeviceId()) throw new TerminalRemoteError('INVALID_PARAMS', 'Cannot connect a device to itself');
     let entry = this.outbound.get(peerId);
     if (!entry) {
-      entry = { id: peerId, topics: new Map(), wanted: true, revision: 0, attempts: 0 };
+      entry = { id: peerId, topics: new Map(), wanted: true, revision: 0 };
       this.outbound.set(peerId, entry);
     }
     entry.wanted = true;
@@ -228,9 +334,9 @@ export class TerminalDeviceService {
       if (this.outbound.get(peerId) !== target || !target.wanted || target.revision !== revision) {
         throw new TerminalRemoteError('LINK_NOT_OPEN', 'Remote connection was closed');
       }
-      if (this.options.isPeerRevoked?.(identity(peerId).deviceId)) throw new TerminalRemoteError('ACCESS_REVOKED', 'Remote device access was revoked');
+      if (this.options.isControlTargetDisabled?.(peerId)) throw new TerminalRemoteError('DEVICE_LINK_CONTROL_DISABLED', 'Device control is disabled locally');
     };
-    target.opening = (async () => {
+    const open = async () => {
       await this.client.waitUntilOnline(); assertTarget();
       const hello = this.options.getHello();
       const accepted = await this.client.openLink(peerId, {
@@ -238,28 +344,37 @@ export class TerminalDeviceService {
         capabilities: this.controllerCapabilities(),
       } satisfies LinkOpenPayload);
       assertTarget();
-      target.accepted = accepted; target.attempts = 0;
-      if (target.topics.size) await this.sendSubscriptions(target, [...target.topics.keys()], true, assertTarget);
+      target.accepted = accepted; this.revokedByRemote.delete(peerId);
+      if (options?.replaySubscriptions !== false && target.topics.size) await this.sendSubscriptions(target, [...target.topics.keys()], true, assertTarget);
       assertTarget();
       return accepted;
-    })().finally(() => { if (this.outbound.get(peerId) === target) target.opening = undefined; });
+    };
+    target.opening = (options?.observed === false ? open() : this.responsiveness.guardInvoke(peerId, OPEN_LINK_OBSERVATION_CHANNEL, open))
+      .finally(() => { if (this.outbound.get(peerId) === target) target.opening = undefined; });
     return target.opening;
   }
 
   /** Deliberate disconnect revokes all local subscriptions and recovery intent. */
   disconnect(peerId: string): void {
     const entry = this.outbound.get(peerId);
-    if (entry) { entry.wanted = false; entry.revision++; clearTimeout(entry.retry); this.outbound.delete(peerId); }
+    this.recovery.cancel(peerId); this.responsiveness.clearDevice(peerId);
+    if (entry) { entry.wanted = false; entry.revision++; this.outbound.delete(peerId); }
     this.client.closeLink(peerId, 'user', 'outbound');
   }
 
   /** Called after persisted revocation changes, without restarting other peers. */
-  revoke(peerId: string): void {
+  revoke(peerId: string, reason: 'revoked' | 'user' = 'revoked'): void {
+    this.peerClosed(peerId, false);
     const entry = this.inbound.get(peerId);
     if (entry) this.closeSubscriptionResources(entry.source);
     this.inbound.delete(peerId);
     for (const invocation of this.invocations.values()) if (invocation.peer === peerId) invocation.abort.abort();
-    this.client.closeLink(peerId, 'revoked', 'inbound');
+    this.client.closeLink(peerId, reason, 'inbound');
+    // A permanent close makes the peer retire its shared reliable stream. Keep
+    // our reverse-control intent/pending traffic, but negotiate again before a
+    // new outbound call; its previous accept no longer describes the peer.
+    const outbound = this.outbound.get(peerId);
+    if (outbound) outbound.accepted = undefined;
   }
 
   /** File/attachment data-channel RPC must re-enter the same authorization
@@ -273,30 +388,42 @@ export class TerminalDeviceService {
     return result;
   }
 
-  async invoke(peerId: string, channel: string, args: unknown[] = []): Promise<unknown> {
+  async invoke(peerId: string, channel: string, args: unknown[] = [], options?: { background?: boolean; preSend?: () => void }): Promise<unknown> {
+    const result=await this.invokeResult(peerId,channel,args,options);
+    if(!result.ok)throw new TerminalRemoteError(result.error.code,result.error.message);
+    return result.result;
+  }
+  /** Original helper adapters need the response envelope and transport errors
+   * separately to distinguish a rejected write from an unknown outcome. */
+  async invokeResult(peerId: string, channel: string, args: unknown[] = [], options?: { background?: boolean; preSend?: () => void }): Promise<InvokeResultPayload> {
+    const calls = this.pendingOutbound.get(peerId) ?? new Set<symbol>();
+    const call = Symbol(); calls.add(call); this.pendingOutbound.set(peerId, calls);
+    try {
+      const result = await this.responsiveness.guardInvoke(peerId, channel, () => this.invokeCore(peerId, channel, args, options));
+      return result;
+    }
+    finally { calls.delete(call); if (!calls.size && this.pendingOutbound.get(peerId) === calls) this.pendingOutbound.delete(peerId); }
+  }
+  private async invokeCore(peerId: string, channel: string, args: unknown[], options?: { background?: boolean; preSend?: () => void }): Promise<InvokeResultPayload> {
     if (!REMOTE_INVOKE_ALLOWLIST.has(channel)) throw new TerminalRemoteError('CHANNEL_NOT_ALLOWED', 'Remote channel is not allowed');
     if (!Array.isArray(args)) throw new TerminalRemoteError('INVALID_PARAMS', 'Remote arguments must be an array');
     const check = this.guard(); check();
-    await this.connect(peerId); check();
+    options?.preSend?.();
+    const accepted = await this.connect(peerId, { observed: false }); check();
+    const assertBackground = () => { if (options?.background) assertBackgroundLinkAccepted(this.outbound.get(peerId)?.accepted ?? accepted, { hasOutboundSubscriptions: () => Boolean(this.outbound.get(peerId)?.topics.size), closeLink: () => this.disconnect(peerId) }); };
+    assertBackground();
     const entry = this.outbound.get(peerId)!;
     const revision = entry.revision;
     const beforeSend = () => {
       check();
+      options?.preSend?.(); assertBackground();
       if (this.outbound.get(peerId) !== entry || !entry.wanted || entry.revision !== revision) throw new TerminalRemoteError('LINK_NOT_OPEN', 'Remote connection was closed');
-      if (this.options.isPeerRevoked?.(identity(peerId).deviceId)) throw new TerminalRemoteError('ACCESS_REVOKED', 'Remote device access was revoked');
+      if (this.options.isControlTargetDisabled?.(peerId)) throw new TerminalRemoteError('DEVICE_LINK_CONTROL_DISABLED', 'Device control is disabled locally');
     };
-    const call = () => this.client.invoke(peerId, { channel, args }, resolveRemoteInvokeTimeoutMs(channel, args), { preSend: beforeSend });
-    let result: InvokeResultPayload;
-    try { result = await call(); }
-    catch (error) {
-      // Only the shared protocol's explicitly replayable reads are retried.
-      // Timeouts/unknown write outcomes never cause a second business action.
-      if (!(error instanceof DeviceLinkError) || error.code !== 'PEER_RESET' || !isPeerResetRetryableInvoke(channel, args)) throw error;
-      beforeSend(); entry.accepted = undefined; await this.connect(peerId); beforeSend(); result = await call();
-    }
+    const call = () => this.client.invoke(peerId, { channel, args }, resolveRemoteInvokeTimeoutMs(channel, args), { preSend: beforeSend, background: options?.background });
+    const result = await invokeWithClosedLinkRecovery(call, async () => { beforeSend(); entry.accepted = undefined; await this.connect(peerId, { observed: false }); }, beforeSend);
     beforeSend();
-    if (!result.ok) throw new TerminalRemoteError(result.error.code, result.error.message);
-    return result.result;
+    return result;
   }
 
   /** Refcounted subscription. Awaiting its disposer stops only this observer. */
@@ -306,7 +433,7 @@ export class TerminalDeviceService {
     let entry = this.outbound.get(peerId);
     if (!entry) {
       identity(peerId);
-      entry = { id: peerId, topics: new Map(), wanted: true, revision: 0, attempts: 0 };
+      entry = { id: peerId, topics: new Map(), wanted: true, revision: 0 };
       this.outbound.set(peerId, entry);
     }
     const target = entry;
@@ -334,15 +461,19 @@ export class TerminalDeviceService {
   }
 
   /** Host event fanout is scoped by authoritative subscriptions, never args. */
-  async publish(channel: string, payload: unknown, ownerStamp?: PushOwnerStamp): Promise<void> {
+  async publish(channel: string, payload: unknown, ownerStamp?: PushOwnerStamp, targetPeerId?: string): Promise<void> {
     const check = this.guard(); check();
     if (!PUSH_FORWARD_ALLOWLIST.has(channel) && !this.options.extraPushChannels?.has(channel)) return;
-    const topic = topicForPush(channel, payload);
+    const regularTopic = topicForPush(channel, payload);
     for (const [peer, entry] of this.inbound) {
+      if (targetPeerId !== undefined && peer !== targetPeerId) continue;
+      const sessionId = record(payload) && typeof payload.sessionId === 'string' ? payload.sessionId : null;
+      const topic: Topic | null = entry.source.kind === 'shared-task' && SHARED_TASK_METADATA.has(channel) && sessionId
+        ? `session:${sessionId}` : regularTopic;
       if (!entry.active || (!entry.legacy && (!topic || !entry.topics.has(topic)))) continue;
       try {
         const authority = await this.authorize(entry.source, undefined, topic ?? undefined); check();
-        if (authority && !authority.allowedPushChannels?.has(channel)) continue;
+        if (authority && (!authority.allowedPushChannels?.has(channel) || authority.acceptsPush?.(channel, payload) === false)) continue;
         if (this.inbound.get(peer) !== entry || !entry.active
           || (!entry.legacy && (!topic || !entry.topics.has(topic)))) continue;
         this.client.sendPush(peer, channel, payload, ownerStamp);
@@ -364,7 +495,7 @@ export class TerminalDeviceService {
   private controllerCapabilities(): string[] {
     return capabilities([
       DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1, DEVICE_LINK_CAPABILITY_TRANSPORT_TIMEOUT_CLOSE,
-      CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1, ...this.options.controllerCapabilities ?? [],
+      CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1, CONTROLLER_CAPABILITY_SET_MODEL_EXPLICIT_PROVIDER_NULL_V1, ...this.options.controllerCapabilities ?? [],
     ]);
   }
   private async authorize(source: TerminalPeerIdentity, channel?: string, topic?: Topic): Promise<TerminalScopedAuthority | null> {
@@ -386,7 +517,7 @@ export class TerminalDeviceService {
     authority?: TerminalScopedAuthority | null): TerminalRemoteContext {
     const check = this.guard();
     return Object.freeze({ source: Object.freeze(source), controllerDeviceId: source.peerId,
-      sourceDeviceId: source.deviceId, requestId, ownerScope: this.ownerScope!, signal: abort.signal,
+      sourceDeviceId: source.deviceId, controllerCapabilities: Object.freeze([...(this.inbound.get(source.peerId)?.controllerCapabilities??[])]), requestId, ownerScope: this.ownerScope!, signal: abort.signal,
       assertCurrent: () => {
         check();
         if (abort.signal.aborted || this.options.isPeerRevoked?.(source.deviceId)) throw new TerminalRemoteError('ACCESS_REVOKED', 'Remote request expired');
@@ -403,10 +534,10 @@ export class TerminalDeviceService {
       if (!record(env.payload) || env.payload.protocolVersion !== PROTOCOL_VERSION) return;
       const check = this.guard();
       try { await this.authorize(source); check(); }
-      catch { this.client.closeLink(source.peerId, 'revoked', 'inbound'); return; }
+      catch { this.revoke(source.peerId); return; }
       const modern = capabilities(env.payload.capabilities).includes(DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1);
       const previous = this.inbound.get(source.peerId);
-      const entry: Inbound = { source, active: true, topics: previous?.topics ?? new Set(),
+      const entry: Inbound = { source, active: true, controllerCapabilities: capabilities(env.payload.capabilities), topics: previous?.topics ?? new Set(),
         modern: modern || previous?.modern === true,
         legacy: source.kind === 'owner' && !modern && !previous?.modern };
       this.client.sendLinkAccept(source.peerId, env.id, { appVersion: this.options.getHello().appVersion,
@@ -416,9 +547,10 @@ export class TerminalDeviceService {
       this.inbound.set(source.peerId, entry);
       for (const invocation of this.invocations.values()) if (invocation.peer === source.peerId && invocation.completed && !invocation.delivered) void this.deliver(invocation, env.id);
     } else if (env.kind === 'link-close') {
+      this.peerClosed(source.peerId, (env.payload as { reason?: unknown })?.reason === 'transport-timeout');
       if ((env.payload as { reason?: unknown })?.reason === 'transport-timeout') {
         const entry = this.outbound.get(source.peerId);
-        if (entry?.wanted) { entry.accepted = undefined; this.scheduleRecovery(entry, 0); }
+        if (entry?.wanted) { entry.accepted = undefined; this.scheduleRecovery(entry); }
       } else {
         const inbound = this.inbound.get(source.peerId);
         if (inbound) this.closeSubscriptionResources(inbound.source);
@@ -426,12 +558,14 @@ export class TerminalDeviceService {
         for (const invocation of this.invocations.values()) if (invocation.peer === source.peerId) invocation.abort.abort();
         // A remote permanent close is not permission to silently reopen it.
         const entry = this.outbound.get(source.peerId);
-        if (entry) { entry.wanted = false; entry.revision++; clearTimeout(entry.retry); }
+        this.recovery.cancel(source.peerId); this.responsiveness.clearDevice(source.peerId);
+        if ((env.payload as { reason?: unknown })?.reason === 'revoked') this.revokedByRemote.add(source.peerId);
+        if (entry) { entry.wanted = false; entry.accepted = undefined; entry.revision++; }
       }
     } else if (env.kind === 'push') {
       const entry = this.outbound.get(source.peerId);
       if (!entry?.wanted || !entry.accepted || !record(env.payload) || typeof env.payload.channel !== 'string') return;
-      if (this.options.isPeerRevoked?.(source.deviceId)) return;
+      if (this.options.isControlTargetDisabled?.(source.peerId)) return;
       const { channel, payload, ownerStamp } = env.payload;
       if (!PUSH_FORWARD_ALLOWLIST.has(channel) && !this.options.extraPushChannels?.has(channel)) return;
       const topic = topicForPush(channel, payload);
@@ -509,6 +643,10 @@ export class TerminalDeviceService {
     try { this.options.onSubscriptionsClosed?.(source); }
     catch { this.options.logger?.warn('Remote subscription cleanup failed'); }
   }
+  private peerClosed(peer: string, transient: boolean): void {
+    try { this.options.onPeerClosed?.(peer, transient); }
+    catch { this.options.logger?.warn('Desktop peer cleanup failed'); }
+  }
 
   private queueInboundSubscription(source: TerminalPeerIdentity, payload: InvokePayload,
     context: TerminalRemoteContext): Promise<{ ok: true }> {
@@ -545,16 +683,25 @@ export class TerminalDeviceService {
     for (const topic of topics) await this.authorize(source, payload.channel, topic);
     context.assertCurrent();
     const previous = this.inbound.get(source.peerId);
-    const entry: Inbound = { source, active: true, topics: new Set(previous?.topics), modern: true, legacy: false };
+    const advertised = record(payload.args[0]) ? payload.args[0].capabilities : undefined;
+    const entry: Inbound = { source, active: true, controllerCapabilities: advertised === undefined ? previous?.controllerCapabilities??[] : capabilities(advertised), topics: new Set(previous?.topics), modern: true, legacy: false };
     for (const topic of topics) {
       if (payload.channel === DL_SUBSCRIBE_CHANNEL) entry.topics.add(topic);
       else entry.topics.delete(topic);
     }
-    if (previous?.modern && previous.active && previous.topics.size === entry.topics.size
+    if (previous?.modern && previous.active && previous.controllerCapabilities.length === entry.controllerCapabilities.length
+      && previous.controllerCapabilities.every(capability => entry.controllerCapabilities.includes(capability)) && previous.topics.size === entry.topics.size
       && [...entry.topics].every(topic => previous.topics.has(topic))) return { ok: true };
     await this.options.onSubscriptionsChanged?.(source, [...entry.topics], context);
     context.assertCurrent();
     this.inbound.set(source.peerId, entry);
+    if (source.kind === 'owner' && entry.topics.has('sessions') && !previous?.topics.has('sessions')) {
+      this.options.replaySessionActivity?.(payload => {
+        context.assertCurrent();
+        void this.publish(SESSION_ACTIVITY_CHANNEL, payload, undefined, source.peerId)
+          .catch(() => this.options.logger?.debug('Session activity replay withheld'));
+      });
+    }
     return { ok: true };
   }
 
@@ -563,29 +710,18 @@ export class TerminalDeviceService {
     if (this.outbound.get(entry.id) !== entry || !entry.wanted) return;
     const live = topics.filter((topic) => subscribe ? entry.topics.has(topic) : !entry.topics.has(topic));
     if (!live.length) return;
-    const result = await this.client.invoke(entry.id, { channel: subscribe ? DL_SUBSCRIBE_CHANNEL : DL_UNSUBSCRIBE_CHANNEL,
+    const channel = subscribe ? DL_SUBSCRIBE_CHANNEL : DL_UNSUBSCRIBE_CHANNEL;
+    const result = await this.responsiveness.guardInvoke(entry.id, channel, () => this.client.invoke(entry.id, { channel,
       args: [{ topics: live, controllerName: this.options.getHello().deviceName, capabilities: this.controllerCapabilities() }] }, undefined,
     { preSend: () => {
       check();
       if (this.outbound.get(entry.id) !== entry || !entry.wanted) throw new TerminalRemoteError('LINK_NOT_OPEN', 'Remote connection was closed');
-    } });
+    } }));
     check();
     if (!result.ok) throw new TerminalRemoteError(result.error.code, result.error.message);
   }
 
-  private scheduleRecovery(entry: Outbound, delay: number): void {
-    if (!this.current() || !entry.wanted || entry.retry) return;
-    const check = this.guard();
-    entry.retry = setTimeout(() => {
-      entry.retry = undefined;
-      if (!this.current() || this.outbound.get(entry.id) !== entry || !entry.wanted) return;
-      void this.connect(entry.id).then(() => check()).catch((error) => {
-        if (!this.current() || !entry.wanted) return;
-        const code = error instanceof DeviceLinkError || error instanceof TerminalRemoteError ? error.code : '';
-        if (['ACCESS_REVOKED', 'REMOTE_DISABLED', 'OWNER_CHANGED', 'VERSION_MISMATCH'].includes(code)) { entry.wanted = false; return; }
-        this.scheduleRecovery(entry, Math.min(30_000, 500 * 2 ** Math.min(entry.attempts++, 6)));
-      });
-    }, delay);
-    entry.retry.unref?.();
+  private scheduleRecovery(entry: Outbound): void {
+    if (this.current() && entry.wanted && this.outbound.get(entry.id) === entry) this.recovery.trigger(entry.id);
   }
 }

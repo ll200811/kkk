@@ -1,7 +1,24 @@
 export type Locale = 'zh-CN' | 'zh-TW' | 'en' | 'ja' | 'ko';
+const silentStopMessages: Record<Locale, string> = {
+  en: 'The model repeatedly returned empty responses. Send a message to continue.',
+  'zh-CN': '模型连续返回空响应，自动续跑已暂停。发送消息可继续任务。',
+  'zh-TW': '模型連續傳回空回應，自動接續已暫停。傳送訊息可繼續任務。',
+  ja: 'モデルが空の応答を繰り返したため、自動再開を停止しました。メッセージを送信すると続行できます。',
+  ko: '모델이 반복해서 빈 응답을 반환하여 자동 재개를 중지했습니다. 메시지를 보내면 작업을 계속할 수 있습니다.',
+};
+export function silentStopMessage(locale: Locale) { return silentStopMessages[locale]; }
+const runtimeRecoveryMessages: Record<Locale, string> = {
+  "en": "Pi extensions could not be refreshed. Restart Cindy before using Pi again.",
+  "zh-CN": "Pi 扩展未能完成刷新。请重启 Cindy 后再使用 Pi。",
+  "zh-TW": "Pi 擴充功能未能完成重新整理。請重新啟動 Cindy 後再使用 Pi。",
+  "ja": "Pi 拡張機能を更新できませんでした。Pi を再び使用する前に Cindy を再起動してください。",
+  "ko": "Pi 확장을 새로 고치지 못했습니다. Pi를 다시 사용하기 전에 Cindy를 다시 시작하세요."
+};
+export function runtimeRecoveryMessage(locale: Locale) { return runtimeRecoveryMessages[locale]; }
 const en = {
-  protocol:'API protocol',engines:'Model engines',install:'Install',update:'Update',notInstalled:'Not installed',providerLogin:'Sign in to provider',you: 'You', tasks: 'Tasks', models: 'Models', connections: 'Connections', service: 'Service',
-  local: 'This computer', emptyTasks: 'No tasks yet', newTask: 'New task', send: 'Send',
+  emptyResources:'Nothing here yet',
+  protocol:'API protocol',engines:'Model engines',install:'Install',update:'Update',repair:'Repair',notInstalled:'Not installed',providerLogin:'Sign in to provider',you: 'You', tasks: 'Sessions', models: 'Models', connections: 'Connections', service: 'Service',
+  local: 'This computer', emptyTasks: 'No sessions yet', newTask: 'New session', send: 'Send',
   back: 'Back', cancel: 'Cancel', save: 'Save', next: 'Next', quit: 'Detach',
   loading: 'Loading…', working: 'Working…', ready: 'Ready', offline: 'Disconnected',
   reconnect: 'Reconnect', refresh: 'Refresh', error: 'The operation could not be completed',
@@ -31,7 +48,8 @@ const en = {
 };
 type Messages = typeof en;
 const zhCN: Messages = {
-  protocol:'API 协议',engines:'模型引擎',install:'安装',update:'更新',notInstalled:'未安装',providerLogin:'登录模型账号',you:'你',tasks:'任务',models:'模型',connections:'连接',service:'服务',local:'这台电脑',emptyTasks:'还没有任务',newTask:'新建任务',send:'发送',
+  emptyResources:'暂无内容',
+  protocol:'API 协议',engines:'模型引擎',install:'安装',update:'更新',repair:'修复',notInstalled:'未安装',providerLogin:'登录模型账号',you:'你',tasks:'任务',models:'模型',connections:'连接',service:'服务',local:'这台电脑',emptyTasks:'还没有任务',newTask:'新建任务',send:'发送',
   back:'返回',cancel:'取消',save:'保存',next:'下一步',quit:'退出界面',loading:'正在加载…',working:'正在处理…',ready:'就绪',offline:'已断开',
   reconnect:'重新连接',refresh:'刷新',error:'操作未完成',noModel:'连接模型后即可开始',addProvider:'添加连接',providerName:'连接名称',address:'API 地址',
   apiKey:'API 密钥',modelId:'模型 ID',engine:'引擎',defaultModel:'默认模型',choose:'选择',test:'测试连接',connected:'已连接',
@@ -45,7 +63,8 @@ const zhCN: Messages = {
   continueLocal:'使用自己的模型',connectionLost:'连接已断开，重新连接后查看执行结果。',refreshLogin:'重新登录',notImplemented:'这台电脑尚不具备此能力。',
 };
 const zhTW: Messages = {
-  protocol:'API 協定',engines:'模型引擎',install:'安裝',update:'更新',notInstalled:'未安裝',providerLogin:'登入模型帳號',you:'你',tasks:'任務',models:'模型',connections:'連線',service:'服務',local:'這部電腦',emptyTasks:'還沒有任務',newTask:'新增任務',send:'傳送',
+  emptyResources:'尚無內容',
+  protocol:'API 協定',engines:'模型引擎',install:'安裝',update:'更新',repair:'修復',notInstalled:'未安裝',providerLogin:'登入模型帳號',you:'你',tasks:'任務',models:'模型',connections:'連線',service:'服務',local:'這部電腦',emptyTasks:'還沒有任務',newTask:'新增任務',send:'傳送',
   back:'返回',cancel:'取消',save:'儲存',next:'下一步',quit:'退出介面',loading:'正在載入…',working:'正在處理…',ready:'就緒',offline:'已中斷',
   reconnect:'重新連線',refresh:'重新整理',error:'操作未完成',noModel:'連接模型後即可開始',addProvider:'新增連線',providerName:'連線名稱',address:'API 位址',
   apiKey:'API 金鑰',modelId:'模型 ID',engine:'引擎',defaultModel:'預設模型',choose:'選擇',test:'測試連線',connected:'已連線',
@@ -59,7 +78,8 @@ const zhTW: Messages = {
   continueLocal:'使用自己的模型',connectionLost:'連線已中斷，重新連線後查看執行結果。',refreshLogin:'重新登入',notImplemented:'這部電腦尚不具備此能力。',
 };
 const ja: Messages = {
-  protocol:'API プロトコル',engines:'モデルエンジン',install:'インストール',update:'更新',notInstalled:'未インストール',providerLogin:'プロバイダーにログイン',you:'あなた',tasks:'セッション',models:'モデル',connections:'接続',service:'サービス',local:'このコンピューター',emptyTasks:'セッションはありません',newTask:'新規セッション',send:'送信',
+  emptyResources:'まだ項目がありません',
+  protocol:'API プロトコル',engines:'モデルエンジン',install:'インストール',update:'更新',repair:'修復',notInstalled:'未インストール',providerLogin:'プロバイダーにログイン',you:'あなた',tasks:'セッション',models:'モデル',connections:'接続',service:'サービス',local:'このコンピューター',emptyTasks:'セッションはありません',newTask:'新規セッション',send:'送信',
   back:'戻る',cancel:'キャンセル',save:'保存',next:'次へ',quit:'画面を閉じる',loading:'読み込み中…',working:'処理中…',ready:'準備完了',offline:'切断済み',
   reconnect:'再接続',refresh:'更新',error:'操作を完了できませんでした',noModel:'モデルを接続すると開始できます',addProvider:'接続を追加',providerName:'接続名',address:'API アドレス',
   apiKey:'API キー',modelId:'モデル ID',engine:'エンジン',defaultModel:'既定のモデル',choose:'選択',test:'接続をテスト',connected:'接続済み',
@@ -73,7 +93,8 @@ const ja: Messages = {
   continueLocal:'自分のモデルを使用',connectionLost:'接続が切れました。再接続して結果を確認してください。',refreshLogin:'再ログイン',notImplemented:'このホストでは利用できません。',
 };
 const ko: Messages = {
-  protocol:'API 프로토콜',engines:'모델 엔진',install:'설치',update:'업데이트',notInstalled:'설치되지 않음',providerLogin:'공급자 로그인',you:'나',tasks:'세션',models:'모델',connections:'연결',service:'서비스',local:'이 컴퓨터',emptyTasks:'세션이 없습니다',newTask:'새 세션',send:'보내기',
+  emptyResources:'아직 항목이 없습니다',
+  protocol:'API 프로토콜',engines:'모델 엔진',install:'설치',update:'업데이트',repair:'복구',notInstalled:'설치되지 않음',providerLogin:'공급자 로그인',you:'나',tasks:'세션',models:'모델',connections:'연결',service:'서비스',local:'이 컴퓨터',emptyTasks:'세션이 없습니다',newTask:'새 세션',send:'보내기',
   back:'뒤로',cancel:'취소',save:'저장',next:'다음',quit:'화면 닫기',loading:'불러오는 중…',working:'처리 중…',ready:'준비됨',offline:'연결 끊김',
   reconnect:'다시 연결',refresh:'새로 고침',error:'작업을 완료하지 못했습니다',noModel:'모델을 연결하면 시작할 수 있습니다',addProvider:'연결 추가',providerName:'연결 이름',address:'API 주소',
   apiKey:'API 키',modelId:'모델 ID',engine:'엔진',defaultModel:'기본 모델',choose:'선택',test:'연결 테스트',connected:'연결됨',
@@ -94,4 +115,151 @@ export function resolveLocale(input = process.env.LC_ALL || process.env.LC_MESSA
   if (/^ja/i.test(input)) return 'ja';
   if (/^ko/i.test(input)) return 'ko';
   return 'en';
+}
+
+const controls = {
+  en:{pluginWriteRecovery:"Confirm plugin write permission again",attachment:'Attachment',effort:'Reasoning effort',permission:'Permissions',plan:'Plan mode',fast:'Fast mode',contextRebuilt:'Context rebuilt',compact:'Compact context',clear:'Clear context',attach:'Add attachment',on:'On',off:'Off',removeAttachments:'Remove attachments',filePath:'Local file path'},
+  'zh-CN':{pluginWriteRecovery:"重新确认插件写权限",attachment:'附件',effort:'思考强度',permission:'权限',plan:'计划模式',fast:'快速模式',contextRebuilt:'已整理上下文',compact:'压缩上下文',clear:'清空上下文',attach:'添加附件',on:'开启',off:'关闭',removeAttachments:'移除附件',filePath:'本地文件路径'},
+  'zh-TW':{pluginWriteRecovery:"重新確認插件寫入權限",attachment:'附件',effort:'思考強度',permission:'權限',plan:'計畫模式',fast:'快速模式',contextRebuilt:'已整理上下文',compact:'壓縮上下文',clear:'清空上下文',attach:'新增附件',on:'開啟',off:'關閉',removeAttachments:'移除附件',filePath:'本機檔案路徑'},
+  ja:{pluginWriteRecovery:"プラグインの書き込み権限を再確認",attachment:'添付ファイル',effort:'推論の強度',permission:'権限',plan:'計画モード',fast:'高速モード',contextRebuilt:'コンテキストを再構築しました',compact:'コンテキストを圧縮',clear:'コンテキストをクリア',attach:'添付ファイルを追加',on:'オン',off:'オフ',removeAttachments:'添付ファイルを削除',filePath:'ローカルファイルのパス'},
+  ko:{pluginWriteRecovery:"플러그인 쓰기 권한 다시 확인",attachment:'첨부 파일',effort:'추론 강도',permission:'권한',plan:'계획 모드',fast:'빠른 모드',contextRebuilt:'컨텍스트를 다시 구성했습니다',compact:'컨텍스트 압축',clear:'컨텍스트 지우기',attach:'첨부 파일 추가',on:'켜기',off:'끄기',removeAttachments:'첨부 파일 제거',filePath:'로컬 파일 경로'},
+};
+export function getControlMessages(locale:Locale){return controls[locale];}
+
+const shellMessages={
+  en:{connected:'Terminal',detach:'Ctrl+] detaches; the shell keeps running.',gap:'Earlier terminal output is no longer in the buffer.'},
+  'zh-CN':{connected:'终端',detach:'Ctrl+] 退出连接，Shell 继续运行。',gap:'更早的终端输出已超出缓冲区。'},
+  'zh-TW':{connected:'終端',detach:'Ctrl+] 退出連線，Shell 繼續執行。',gap:'更早的終端輸出已超出緩衝區。'},
+  ja:{connected:'ターミナル',detach:'Ctrl+] で切断します。シェルは実行を続けます。',gap:'以前のターミナル出力はバッファーに残っていません。'},
+  ko:{connected:'터미널',detach:'Ctrl+]로 연결을 종료합니다. 셸은 계속 실행됩니다.',gap:'이전 터미널 출력이 버퍼 범위를 벗어났습니다.'},
+};
+export function getShellMessages(locale:Locale){return shellMessages[locale];}
+
+const modelMessages={
+  en:{manage:'Manage connections',edit:'Edit connection',custom:'Custom API',source:'Connection source',discover:'Get model list',test:'Generation test (may incur a charge)',testPassed:'Generation test passed',disable:'Disable',enable:'Enable',reset:'Restore defaults',disconnect:'Disconnect account',remove:'Remove connection',keepKey:'New API key (leave blank to keep)',addModel:'Add model',configure:'Configure model',contextLimit:'Context limit',context:'Context window (tokens)',modelName:'Model name',headers:'Replace request headers (JSON, leave blank to keep)',auth:'Authentication',none:'No authentication',apiKey:'API key',testResult:'Test result'},
+  'zh-CN':{manage:'管理连接',edit:'编辑连接',custom:'自定义 API',source:'连接来源',discover:'获取模型列表',test:'生成测试（可能产生费用）',testPassed:'生成测试通过',disable:'停用',enable:'启用',reset:'恢复默认',disconnect:'断开账号',remove:'移除连接',keepKey:'新 API 密钥（留空保留）',addModel:'添加模型',configure:'配置模型',contextLimit:'上下文上限',context:'上下文窗口（Token）',modelName:'模型名称',headers:'替换请求头（JSON，留空保留）',auth:'认证方式',none:'无需认证',apiKey:'API 密钥',testResult:'测试结果'},
+  'zh-TW':{manage:'管理連線',edit:'編輯連線',custom:'自訂 API',source:'連線來源',discover:'取得模型清單',test:'生成測試（可能產生費用）',testPassed:'生成測試通過',disable:'停用',enable:'啟用',reset:'恢復預設',disconnect:'中斷帳號',remove:'移除連線',keepKey:'新 API 金鑰（留空保留）',addModel:'新增模型',configure:'設定模型',contextLimit:'上下文上限',context:'上下文視窗（Token）',modelName:'模型名稱',headers:'替換請求標頭（JSON，留空保留）',auth:'認證方式',none:'無需認證',apiKey:'API 金鑰',testResult:'測試結果'},
+  ja:{manage:'接続を管理',edit:'接続を編集',custom:'カスタム API',source:'接続元',discover:'モデル一覧を取得',test:'生成テスト（料金が発生する場合があります）',testPassed:'生成テストに成功しました',disable:'無効にする',enable:'有効にする',reset:'既定に戻す',disconnect:'アカウントを切断',remove:'接続を削除',keepKey:'新しい API キー（空欄で保持）',addModel:'モデルを追加',configure:'モデルを設定',contextLimit:'コンテキスト上限',context:'コンテキストウィンドウ（トークン）',modelName:'モデル名',headers:'リクエストヘッダーを置換（JSON、空欄で保持）',auth:'認証方法',none:'認証なし',apiKey:'API キー',testResult:'テスト結果'},
+  ko:{manage:'연결 관리',edit:'연결 편집',custom:'사용자 지정 API',source:'연결 소스',discover:'모델 목록 가져오기',test:'생성 테스트 (요금이 발생할 수 있음)',testPassed:'생성 테스트 성공',disable:'비활성화',enable:'활성화',reset:'기본값 복원',disconnect:'계정 연결 해제',remove:'연결 삭제',keepKey:'새 API 키 (비워 두면 유지)',addModel:'모델 추가',configure:'모델 설정',contextLimit:'컨텍스트 한도',context:'컨텍스트 창 (토큰)',modelName:'모델 이름',headers:'요청 헤더 교체 (JSON, 비워 두면 유지)',auth:'인증 방식',none:'인증 없음',apiKey:'API 키',testResult:'테스트 결과'},
+};
+export function getModelMessages(locale:Locale){return modelMessages[locale];}
+
+const serviceMessages:Record<Locale,{activate:string;running:string;boot:string}>={
+ en:{activate:'Start managed service now',running:'Running under system service manager',boot:'Start at boot (OS authorization required)'},
+ 'zh-CN':{activate:'立即启用常驻服务',running:'正由系统服务管理器运行',boot:'开机启动（需要系统授权）'},
+ 'zh-TW':{activate:'立即啟用常駐服務',running:'正由系統服務管理員執行',boot:'開機啟動（需要系統授權）'},
+ ja:{activate:'常駐サービスを今すぐ開始',running:'システムサービスとして実行中',boot:'起動時に開始（システム認証が必要）'},
+ ko:{activate:'상주 서비스 지금 시작',running:'시스템 서비스로 실행 중',boot:'부팅 시 시작 (시스템 인증 필요)'},
+};
+export function getServiceMessages(locale:Locale){return serviceMessages[locale];}
+
+const channelPermissionMessages: Record<Locale, string> = {
+  "en": "The current Agent cannot run on this channel in this permission mode, so messages cannot be processed. Send /permission to choose a supported mode.",
+  "zh-CN": "当前 Agent 不支持以此权限模式在该渠道运行，消息将无法处理。请发送 /permission 调整权限模式。",
+  "zh-TW": "目前 Agent 不支援以此權限模式在該渠道執行，訊息將無法處理。請傳送 /permission 調整權限模式。",
+  "ja": "現在の Agent はこの権限モードではこのチャンネルを利用できないため、メッセージを処理できません。/permission を送信して対応する権限モードに変更してください。",
+  "ko": "현재 Agent는 이 권한 모드로 이 채널에서 실행할 수 없어 메시지를 처리할 수 없습니다. /permission을 보내 지원되는 권한 모드로 변경하세요."
+};
+export function channelPermissionUnavailable(locale: Locale) { return channelPermissionMessages[locale]; }
+
+const telegramCommandMenus: Record<Locale, Record<string, string>> = {
+  "en": {
+    "start": "Welcome and usage",
+    "new": "Create a new session",
+    "help": "Show command help",
+    "stop": "Stop the current task",
+    "session": "Recent sessions, pick one to continue",
+    "project": "Switch project workspace",
+    "model": "Show or switch the model",
+    "permission": "Show or switch the permission mode",
+    "settings": "Show project and agent settings",
+    "ctr": "Remotely control a desktop session",
+    "exctr": "Exit remote control",
+    "workspace": "Switch project workspace",
+    "unbind": "Clear the current project mapping",
+    "effort": "Choose reasoning effort",
+    "agent": "Choose an Agent",
+    "status": "Show link status",
+    "unlink": "Unlink Telegram"
+  },
+  "zh-CN": {
+    "start": "查看欢迎信息和用法",
+    "new": "创建新任务",
+    "help": "查看命令帮助",
+    "stop": "中止当前执行",
+    "session": "最近任务列表，选中即续聊",
+    "project": "切换项目工作区",
+    "model": "查看或切换模型",
+    "permission": "查看或切换权限模式",
+    "settings": "查看当前项目与 Agent 设置",
+    "ctr": "接管桌面端的任务",
+    "exctr": "退出远程控制",
+    "workspace": "切换项目工作区",
+    "unbind": "清除当前项目映射",
+    "effort": "选择推理强度",
+    "agent": "选择 Agent",
+    "status": "查看关联状态",
+    "unlink": "解除 Telegram 关联"
+  },
+  "zh-TW": {
+    "start": "檢視歡迎資訊和用法",
+    "new": "建立新任務",
+    "help": "檢視命令幫助",
+    "stop": "中止當前執行",
+    "session": "最近任務列表，選中即續聊",
+    "project": "切換專案工作區",
+    "model": "檢視或切換模型",
+    "permission": "檢視或切換權限模式",
+    "settings": "檢視目前專案與 Agent 設定",
+    "ctr": "接管桌面端的任務",
+    "exctr": "退出遠端控制",
+    "workspace": "切換專案工作區",
+    "unbind": "清除目前專案對應",
+    "effort": "選擇推理強度",
+    "agent": "選擇 Agent",
+    "status": "檢視關聯狀態",
+    "unlink": "解除 Telegram 關聯"
+  },
+  "ja": {
+    "start": "ようこそと使い方を表示",
+    "new": "新しいセッションを作成",
+    "help": "コマンドヘルプを表示",
+    "stop": "現在のタスクを停止",
+    "session": "最近のセッション一覧から続行",
+    "project": "プロジェクトワークスペースを切り替え",
+    "model": "モデルを表示・切り替え",
+    "permission": "権限モードを表示・切り替え",
+    "settings": "プロジェクトと Agent 設定を表示",
+    "ctr": "デスクトップセッションをリモート操作",
+    "exctr": "リモート操作を終了",
+    "workspace": "プロジェクトワークスペースを切り替え",
+    "unbind": "現在のプロジェクト設定を解除",
+    "effort": "推論強度を選択",
+    "agent": "Agent を選択",
+    "status": "連携状態を表示",
+    "unlink": "Telegram 連携を解除"
+  },
+  "ko": {
+    "start": "환영 메시지와 사용법 보기",
+    "new": "새 세션 만들기",
+    "help": "명령어 도움말 보기",
+    "stop": "현재 작업 중지",
+    "session": "최근 세션 목록에서 이어서 대화",
+    "project": "프로젝트 워크스페이스 전환",
+    "model": "모델 보기·전환",
+    "permission": "권한 모드 보기·전환",
+    "settings": "프로젝트와 Agent 설정 보기",
+    "ctr": "데스크톱 세션 원격 제어",
+    "exctr": "원격 제어 종료",
+    "workspace": "프로젝트 워크스페이스 전환",
+    "unbind": "현재 프로젝트 매핑 해제",
+    "effort": "추론 강도 선택",
+    "agent": "Agent 선택",
+    "status": "연결 상태 보기",
+    "unlink": "Telegram 연결 해제"
+  }
+};
+export function telegramCommandDescription(locale: Locale, key: string) {
+  const command = key.replace(/^settings\.telegramBot\.commandMenu\./, "");
+  return telegramCommandMenus[locale][command] ?? telegramCommandMenus.en[command] ?? command;
 }

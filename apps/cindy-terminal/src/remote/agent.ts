@@ -1,3 +1,5 @@
+import type { ProviderListOptions } from '@cindy/app-runtime/providerService';
+import { withoutProviderHeaderCredentials } from '@cindy/app-runtime/providerViewProjection';
 import path from 'node:path';
 import { REMOTE_AGENT_CHANNEL } from '@cindy/device-link';
 import { createRemoteAgentHost, type RemoteAgentHostDeps, type RemoteAgentHost } from '@cindy/remote-agent';
@@ -9,7 +11,7 @@ import type { TerminalRemoteContext } from './types.js';
 export interface TerminalRemoteAgentOptions {
   profileDir: string;
   getOwnerScope(): string | null;
-  readProviders(): Promise<readonly ProviderView[]>;
+  readProviders(options?: Partial<ProviderListOptions>): Promise<readonly ProviderView[]>;
   startHosted: RemoteAgentHostDeps['startHosted'];
   isAgentAvailable: RemoteAgentHostDeps['isAgentAvailable'];
   /** Shared memberships need their real isolation, outbound route, and model
@@ -105,10 +107,13 @@ export class TerminalRemoteAgentService {
     this.allowed = new Set(input.allowedProviders);
   }
   enabled(providerId: string): boolean { return !this.closed && this.allowed.has(providerId); }
+  ownerController(controller:string):boolean{
+    try{this.assertCurrent();const context=this.controllers.get(controller);context?.assertCurrent();return context?.source.kind==='owner';}catch{return false;}
+  }
   async views(): Promise<ProviderView[]> {
     await this.ready; this.assertCurrent();
-    const views = await this.options.readProviders(); this.assertCurrent();
-    return views.map(view => ({ ...view, remoteInvocationEnabled: this.allowed.has(view.id) }));
+    const views = await this.options.readProviders({allowSideEffects:false}); this.assertCurrent();
+    return views.map(view => ({ ...withoutProviderHeaderCredentials(view), remoteInvocationEnabled: this.allowed.has(view.id) }));
   }
   setEnabled(providerId: string, enabled: boolean, guard: () => void): Promise<void> {
     const pending = this.writes.then(async () => {
@@ -136,7 +141,7 @@ export class TerminalRemoteAgentService {
   async stop(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    await this.host.abortAll('app-quit'); this.host.dispose();
+    await this.host.abortAll('app-quit'); await this.host.dispose();
     this.controllers.clear(); await this.writes;
   }
 }

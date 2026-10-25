@@ -1,3 +1,4 @@
+import { createConfiguredContextWindowResolver } from '@cindy/app-runtime/modelContextSettings';
 import { isCodexGatewayWireModel, type AgentKind, type Catalog, type Effort } from '@cindy/model-providers';
 
 import { desktopCodexAuthAdapter, readClaudeApiKey } from './auth-adapters.js';
@@ -45,20 +46,4 @@ export function resolveDesktopModelEfforts(
 }
 
 /** Working budgets can tighten history protection, but never raise its verified ceiling. */
-export function resolveConfiguredContextWindow(
-  catalog: Pick<Catalog, 'providers'>,
-  agent: AgentKind,
-  providerId: string | null | undefined,
-  modelId: string,
-): number | null {
-  const source = resolveDesktopModelContextProviderId(catalog, agent, providerId, modelId);
-  const budget = source ? readModelContextLimit(agent, source, modelId) : null;
-  const verified = resolveVerifiedContextWindow(catalog, agent, source, modelId, budget);
-  if (verified !== null) return verified;
-  // A saved budget configures the native runtime even if catalog capacity is
-  // unknown. It is a working ceiling, not evidence of physical model capacity.
-  const rows = catalog.providers.filter(provider => provider.id === source && provider.routing[agent]?.disabled !== true)
-    .flatMap(provider => (provider.models[agent] ?? []).filter(model => model.id === modelId));
-  return rows.length === 1 && rows[0]!.contextWindowVerified !== true && typeof budget === 'number' && Number.isFinite(budget) && budget > 0
-    ? budget : null;
-}
+export const resolveConfiguredContextWindow = createConfiguredContextWindowResolver({resolveDesktopModelContextProviderId, readModelContextLimit});

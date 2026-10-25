@@ -55,7 +55,7 @@ vi.mock('../workdir-resolver', () => ({
   resolveWorkingDir: mocks.resolveWorkingDir,
 }));
 
-vi.mock('../runners/_shared', () => ({
+vi.mock('@cindy/app-runtime/scheduleRunnerShared', () => ({
   backfillSessionMeta: mocks.backfillSessionMeta,
 }));
 

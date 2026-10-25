@@ -34,7 +34,7 @@ function createLocalDb(): Database.Database {
       effort TEXT NOT NULL DEFAULT 'high',
       permission_mode TEXT NOT NULL DEFAULT 'ask',
       status TEXT NOT NULL DEFAULT 'active',
-      orca_role TEXT,
+      orca_role TEXT, orca_remote_lead TEXT,
       user_send_at INTEGER,
       agent_kind TEXT NOT NULL DEFAULT 'cc',
       parent_session_id TEXT,

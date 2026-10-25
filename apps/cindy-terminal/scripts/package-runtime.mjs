@@ -13,9 +13,13 @@ import { tmpdir } from 'node:os';
 import { mkdtemp } from 'node:fs/promises';
 import * as tar from 'tar';
 import * as yauzl from 'yauzl';
+import { runtimePackages, imRuntimePackages } from './runtime-externals.mjs';
+import { READ_SHEET_RUNTIME_PACKAGES } from '../../../packages/lizi-mcps/src/cindy-docs/readSheetRuntimeDeps.ts';
 
 const app = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(path.join(app, 'package.json'));
+const { version } = JSON.parse(await readFile(path.join(app, 'dist/build-info.json'), 'utf8'));
+if (typeof version !== 'string' || require('semver').valid(version) !== version) throw new Error('Invalid build version; rebuild the terminal bundle.');
 const args = process.argv.slice(2);
 const value = name => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
 const target = value('--target') || `${process.platform}-${process.arch}`;
@@ -41,7 +45,7 @@ try {
   await mkdir(path.join(output, 'app'), { recursive: true });
   await cp(path.join(app, 'dist'), path.join(output, 'app/dist'), { recursive: true });
   const metadata = JSON.parse(await readFile(path.join(app, 'package.json'), 'utf8'));
-  await writeFile(path.join(output, 'app/package.json'), JSON.stringify({ name: metadata.name, version: metadata.version, type: 'module', private: true }));
+  await writeFile(path.join(output, 'app/package.json'), JSON.stringify({ name: metadata.name, version, type: 'module', private: true }));
 
   const copied = new Map();
   const included = [];
@@ -91,7 +95,24 @@ try {
       await copyPackage(dependency, source, destination, [parentDestination, ...ancestors]);
     }
   };
-  for (const name of ['ink', 'react', '@roamhq/wrtc', 'better-sqlite3', 'sharp', 'node-pty', 'ssh2']) await copyPackage(name, app, path.join(output, 'app'));
+  // Install the renderer's singleton peer first. A nested React copied while
+  // traversing Ink/reconciler would cause real TUI hooks to use another runtime.
+  for (const name of runtimePackages) await copyPackage(name, app, path.join(output, 'app'));
+  for (const name of imRuntimePackages) await copyPackage(name, path.join(app, '../../packages/lizi-im'), path.join(output, 'app'));
+  for (const name of READ_SHEET_RUNTIME_PACKAGES) await copyPackage(name, path.join(app, '../../packages/lizi-mcps'), path.join(output, 'app'));
+
+  // The published macOS node-pty prebuild can have mode 0644 even though
+  // posix_spawn requires its spawn-helper to be executable. Fix the shipped
+  // artifact, independently of npm lifecycle scripts on the build computer.
+  if (process.platform === 'darwin') {
+    let found = false;
+    for (const relative of ['build/Release', 'build/Debug', `prebuilds/darwin-${process.arch}`]) {
+      const helper = path.join(output, 'app/node_modules/node-pty', relative, 'spawn-helper');
+      try { await access(helper); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      await chmod(helper, 0o755); found = true;
+    }
+    if (!found) throw new Error('Packaged node-pty spawn-helper is missing');
+  }
 
   const [suffix, digest] = runtimes[target];
   const archiveName = `node-v${nodeVersion}-${suffix}`;
@@ -129,14 +150,15 @@ try {
   // Use the bundled Node, not the build machine's Node. Exercise actual native
   // modules; a cross-ABI SQLite or missing WebRTC artifact blocks publication.
   const node = path.join(output, 'runtime', windows ? 'node.exe' : 'node');
-  const smoke = `const req=require('node:module').createRequire(${JSON.stringify(path.join(output, 'app/package.json'))}); req('react');req('node-pty');req('ssh2');const db=new (req('better-sqlite3'))(':memory:');db.prepare('select 1').get();db.close();req('sharp');const p=new (req('@roamhq/wrtc').RTCPeerConnection)();p.close();`;
+  const smoke = `const {createRequire}=require('node:module');const req=createRequire(${JSON.stringify(path.join(output, 'app/package.json'))});const inkReq=createRequire(req.resolve('ink'));const reconcilerReq=createRequire(inkReq.resolve('react-reconciler'));if(req('react')!==inkReq('react')||req('react')!==reconcilerReq('react'))throw Error('Duplicate React runtime');req('node-pty');req('ssh2');const db=new (req('better-sqlite3'))(':memory:');db.prepare('select 1').get();db.close();req('sharp');const p=new (req('@roamhq/wrtc').RTCPeerConnection)();p.close();`;
   const smokeHome = path.join(stage, 'home');
   await mkdir(smokeHome);
   for (const command of [['--input-type=commonjs', '-e', smoke], [path.join(output, 'app/dist/cli.js'), '--version'], [path.join(output, 'app/dist/cli.js'), '--help']]) {
     const check = spawnSync(node, command, { cwd: output, encoding: 'utf8', timeout: 30_000, env: { ...process.env, HOME: smokeHome, USERPROFILE: smokeHome, XDG_CONFIG_HOME: smokeHome, XDG_STATE_HOME: smokeHome, LOCALAPPDATA: smokeHome, NODE_PATH: '', NODE_OPTIONS: '' } });
     if (check.status !== 0) throw new Error(`Runtime smoke failed: ${check.error?.message || check.stderr || check.stdout}`);
+    if (command[1] === '--version' && check.stdout.trim() !== version) throw new Error('Packaged CLI version does not match its build manifest');
   }
-  await writeFile(path.join(output, 'runtime-manifest.json'), JSON.stringify({ version: metadata.version, target, node: { version: nodeVersion, sha256: digest }, packages: included }, null, 2));
+  await writeFile(path.join(output, 'runtime-manifest.json'), JSON.stringify({ version, target, node: { version: nodeVersion, sha256: digest }, packages: included }, null, 2));
   await tar.c({ file: `${output}.tar.gz`, gzip: true, cwd: path.dirname(output), portable: true }, [path.basename(output)]);
   const checksum = createHash('sha256');
   for await (const chunk of createReadStream(`${output}.tar.gz`)) checksum.update(chunk);
