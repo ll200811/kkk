@@ -610,6 +610,16 @@ describe('Bot global model restore IPC', () => {
 });
 
 describe('Bot canonical Session lifecycle', () => {
+  it('reads the stored 代输入 and follow-by-scheduler choices back into the settings profile', async () => {
+    expect((await invoke('local-db:bots:get', 'bot-1')).capabilities).not.toHaveProperty('inputHandoff');
+    await invoke('local-db:bots:update', { id: 'bot-1', capabilities: { inputHandoff: false, allowSchedulerFollow: true } });
+    expect((await invoke('local-db:bots:get', 'bot-1')).capabilities).toMatchObject({ inputHandoff: false, allowSchedulerFollow: true });
+    await invoke('local-db:bots:update', { id: 'bot-1', capabilities: { inputHandoff: true, allowSchedulerFollow: false } });
+    const reset = (await invoke('local-db:bots:get', 'bot-1')).capabilities;
+    expect(reset.inputHandoff).not.toBe(false);
+    expect(reset.allowSchedulerFollow).not.toBe(true);
+  });
+
   it.each(['inherit', 'allowlist'])('omits retired toolsets from the %s companion settings and discovery', async (mode) => {
     const row = h.sqlite!.prepare('SELECT capabilities_json FROM bot_profile_versions WHERE bot_id = ? AND version = 1')
       .get('bot-1') as { capabilities_json: string };
@@ -3134,6 +3144,33 @@ describe('Bot canonical Session lifecycle', () => {
     }
   });
 
+  // P1 integration: a quarantined persisted row used to duplicate the native
+  // capability id, making selection operate on the wrong entry.
+  it('lists and selects native Apps once despite a retained custom collision', async () => {
+    h.customMcpConfigs.push({ id: 'codex_apps', name: 'Legacy custom Apps', transport: 'http',
+      url: 'https://example.invalid/legacy', headers: {} });
+    await refreshCustomMcpProviders();
+    await invoke('local-db:bots:update', {
+      id: 'bot-1', capabilities: { mcpServers: [], mcpMode: 'allowlist' },
+    });
+    const created = await invoke('local-db:bots:create-canonical-session', {
+      botId: 'bot-1', expectedCanonicalSessionId: null, expectedProfileVersion: 2,
+    });
+    const service = createBotCapabilityService({ ...capabilityDeps, resolveBotAgentKind: async () => 'codex' });
+    h.validateCapabilityAdditions.mockImplementation(service.validateAdditions);
+    const input = { callerSessionId: created.session.id, kind: 'mcp' as const, id: 'codex_apps' };
+    const result = await service.list(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.message);
+    expect(result.capabilities.filter((entry) => entry.id === 'codex_apps')).toEqual([
+      expect.objectContaining({ name: 'codex_apps', available: true, joined: false }),
+    ]);
+    await expect(service.select({ ...input, joined: true })).resolves.toMatchObject({ ok: true });
+    await expect(service.select({ ...input, joined: false })).resolves.toMatchObject({ ok: true });
+    expect(h.mcpProviders.some((provider) => provider.name === 'codex_apps')).toBe(false);
+    expect(h.customMcpConfigs.some((entry) => entry.id === 'codex_apps')).toBe(true);
+  });
+
   it('rejects unforwarded custom MCPs on SSH Codex while preserving saved references and supported routes', async () => {
     await invoke('local-db:bots:update', {
       id: 'bot-1', capabilities: { mcpServers: ['shared-docs'], mcpMode: 'allowlist' },
@@ -3146,7 +3183,11 @@ describe('Bot canonical Session lifecycle', () => {
     for (const agentKind of ['codex', 'claude-code', 'pi'] as const) {
       const service = createBotCapabilityService({ ...capabilityDeps, resolveBotAgentKind: async () => agentKind });
       await expect(service.list(input)).resolves.toMatchObject({
-        capabilities: [expect.objectContaining({ id: 'shared-docs', joined: true, available: agentKind !== 'codex' })],
+        capabilities: [
+          expect.objectContaining({ id: 'shared-docs', joined: true, available: agentKind !== 'codex' }),
+          // Native Apps is discoverable but cannot be selected on SSH Codex.
+          ...(agentKind === 'codex' ? [expect.objectContaining({ id: 'codex_apps', joined: false, available: false })] : []),
+        ],
       });
       const opts: MakerSessionCreateOpts = {
         id: created.session.id, agentKind, workingDir: '/srv/bot', remoteHostId: 'ssh-host',
@@ -3161,6 +3202,8 @@ describe('Bot canonical Session lifecycle', () => {
     }
     const service = createBotCapabilityService({ ...capabilityDeps, resolveBotAgentKind: async () => 'codex' });
     h.validateCapabilityAdditions.mockImplementation(service.validateAdditions);
+    await expect(service.select({ ...input, id: 'codex_apps', joined: true }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'CAPABILITY_UNAVAILABLE' });
     await expect(service.select({ ...input, joined: false })).resolves.toMatchObject({ ok: true, joined: false });
     await expect(service.select({ ...input, joined: true })).resolves.toMatchObject({ ok: false, errorCode: 'CAPABILITY_UNAVAILABLE' });
     await expect(invoke('local-db:bots:update', { id: 'bot-1', capabilities: { mcpServers: ['shared-docs'] } }))
@@ -5991,6 +6034,27 @@ describe('Bot Session task end-to-end runtime', () => {
         expect(await service.list({ callerSessionId: 'group-lane', kind: 'mcp' })).toMatchObject({ ok: true });
         expect(listMcpServers).toHaveBeenCalledOnce();
       } finally { releaseOwner(); }
+    } finally { release(); }
+  });
+
+  // Cross-channel recall needs live connection discovery, but a group self-read must
+  // not reveal the owner's other connections. Existing model tests did not cover it.
+  it('exposes conversation discovery only with owner access', async () => {
+    await seedPair(); seedGroupLane();
+    const readConversationConnections = vi.fn(async () => [{ channel: 'telegram', connectionId: 'fixture', status: 'offline' }]);
+    const service = createBotCapabilityService({ ...capabilityDeps, readConversationConnections });
+    const owner = await service.inspect({ callerSessionId: 'session-1' });
+    expect(owner).toMatchObject({ ok: true, state: { conversations: {
+      scope: 'local', teammateId: 'bot-a', connectionsAvailable: true,
+      connections: [{ channel: 'telegram', status: 'offline' }],
+    } } });
+    expect(readConversationConnections).toHaveBeenCalledWith('bot-a');
+    readConversationConnections.mockClear();
+    const release = registerGroupToolAuthority('group-lane', { botId: 'bot-a', mode: 'tools', isCurrent: () => true, validate: async () => {} });
+    try {
+      const guest = await service.inspect({ callerSessionId: 'group-lane' });
+      expect(guest.ok && guest.state.conversations).toBeUndefined();
+      expect(readConversationConnections).not.toHaveBeenCalled();
     } finally { release(); }
   });
 
