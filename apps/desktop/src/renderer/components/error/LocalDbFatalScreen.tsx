@@ -29,9 +29,14 @@ export function LocalDbFatalScreen({
   // 点了「重启并安装更新」后应用即将退出重启，期间锁住按钮防止重复触发。
   const [installing, setInstalling] = useState(false);
 
-  const view = resolveLocalDbFatalView(status);
+  const view = resolveLocalDbFatalView(status, code);
 
   const handleConfirm = () => {
+    if (view === 'init-failed') {
+      // 重新走一遍 ensureReady；与应用更新无关。
+      window.location.reload();
+      return;
+    }
     if (view === 'install-update') {
       if (installing) return;
       setInstalling(true);
@@ -46,17 +51,25 @@ export function LocalDbFatalScreen({
   };
 
   const title =
-    view === 'no-update' ? t('localDbFatal.noUpdate.title') : t('localDbFatal.updateReady.title');
+    view === 'init-failed'
+      ? t('localDbFatal.initFailed.title')
+      : view === 'no-update'
+        ? t('localDbFatal.noUpdate.title')
+        : t('localDbFatal.updateReady.title');
   const description =
-    view === 'install-update'
+    view === 'init-failed'
+      ? t('localDbFatal.initFailed.description')
+      : view === 'install-update'
       ? t('localDbFatal.updateReady.description')
       : view === 'preparing-update'
         ? t('localDbFatal.preparing.description')
         : t('localDbFatal.noUpdate.description');
   const confirmText =
-    view === 'install-update'
-      ? t('localDbFatal.updateReady.confirm')
-      : t('localDbFatal.noUpdate.checkUpdate');
+    view === 'init-failed'
+      ? t('localDbFatal.initFailed.retry')
+      : view === 'install-update'
+        ? t('localDbFatal.updateReady.confirm')
+        : t('localDbFatal.noUpdate.checkUpdate');
 
   return (
     <div
