@@ -93,6 +93,7 @@ export class TerminalOrcaStore {
   reconcileInactiveTeamWorkersForLead = (...args: Parameters<Store['reconcileInactiveTeamWorkersForLead']>) => this.run(api => api.reconcileInactiveTeamWorkersForLead(...args));
   getTeamByWorkerSession = (...args: Parameters<Store['getTeamByWorkerSession']>) => this.run(api => api.getTeamByWorkerSession(...args));
   addOrUpdateWorker = (...args: Parameters<Store['addOrUpdateWorker']>) => this.run(api => api.addOrUpdateWorker(...args));
+  updateWorkerIdentity = (...args: Parameters<Store['updateWorkerIdentity']>) => this.run(api => api.updateWorkerIdentity(...args));
   listWorkersByLead = (...args: Parameters<Store['listWorkersByLead']>) => this.run(api => api.listWorkersByLead(...args));
   listWorkersByLeads = (...args: Parameters<Store['listWorkersByLeads']>) => this.run(api => api.listWorkersByLeads(...args));
   getWorkerLink = (...args: Parameters<Store['getWorkerLink']>) => this.run(api => api.getWorkerLink(...args));

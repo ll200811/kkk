@@ -6,6 +6,7 @@ import type { OrcaLifecycleService } from '@cindy/orca-workflow/host/orcaLifecyc
 import type { OrcaRemoteWorkers } from '@cindy/orca-workflow/host/orcaRemoteWorkers';
 import { deviceAvailableModels } from '@cindy/orca-workflow/host/orcaProviderRoutingContext';
 import type { ProviderView } from '@cindy/model-providers';
+import { normalizeOrcaWorkerLabel, normalizeOrcaWorkerRole } from '@cindy/maker-shared/orca-team';
 import type { TerminalOrcaStore } from './orca-store.js';
 import type { TerminalTaskStorage } from './storage.js';
 
@@ -70,6 +71,39 @@ export function createTerminalOrcaTools(deps: {
       const result = await deps.team.archiveWorker(input);
       if (result.ok) return result.workerId ? { ok: true, workerId: result.workerId } : { ok: false, errorCode: 'INTERNAL', message: 'Worker result unavailable' };
       return { ...result, errorCode: result.errorCode === 'WORKER_NOT_FOUND' ? result.errorCode : 'INTERNAL' };
+    },
+    updateWorker: async input => {
+      const workers = await deps.store.listWorkersByLead(input.callerLeadSessionId);
+      const worker = workers.find(item => item.id === input.workerId);
+      if (!worker) return { ok: false, errorCode: 'WORKER_NOT_FOUND', message: 'Worker not found' };
+      if (input.role === undefined && input.label === undefined) {
+        return { ok: false, errorCode: 'INVALID_PARAMS', message: 'role or label required' };
+      }
+      const roleResult = normalizeOrcaWorkerRole(input.role ?? worker.role);
+      if (!roleResult.ok) {
+        return { ok: false, errorCode: 'INVALID_PARAMS', message: 'role and label must be non-empty' };
+      }
+      const role = roleResult.value;
+      let label = worker.label;
+      if (input.label !== undefined) {
+        const labelResult = normalizeOrcaWorkerLabel(input.label);
+        if (!labelResult.ok) return { ok: false, errorCode: 'INVALID_PARAMS', message: labelResult.message };
+        label = labelResult.value;
+      }
+      const updated = await deps.store.updateWorkerIdentity({
+        workerId: worker.id,
+        role,
+        label,
+        previousRole: worker.role,
+        previousLabel: worker.label,
+      });
+      if (!updated.ok) {
+        return updated.errorCode === 'DUPLICATE_LABEL'
+          ? { ok: false, errorCode: 'DUPLICATE_LABEL', message: 'Worker label already exists' }
+          : { ok: false, errorCode: 'WORKER_NOT_FOUND', message: 'Worker not found' };
+      }
+      deps.changed(input.callerLeadSessionId);
+      return { ok: true, workerId: worker.id, role, label };
     },
     endTeam: async ({ leadSessionId }) => { await deps.end(leadSessionId); return { ok: true }; },
     listAvailableModels: async ({ agent, callerSessionId, executionDeviceId, agentDeviceId: requestedDevice }) => {

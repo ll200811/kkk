@@ -4,6 +4,7 @@ import { and, desc, eq, gt, sql, inArray, isNotNull, isNull, ne } from 'drizzle-
 import { createId } from '@paralleldrive/cuid2';
 import type { OrcaRemotePendingReport } from '@cindy/maker-shared/orca-remote-worker';
 import { parseOrcaRemoteLead } from '@cindy/maker-shared/orca-remote-worker';
+import { orcaWorkerSessionTitle } from '@cindy/maker-shared/orca-team';
 import type { OrcaRemoteWorkerProxySessionSeed } from '@cindy/runtime-db/client/tx/types';
 import { orcaWorkers, orcaTeams, orcaWorkerCreationReservations, orcaRemoteOpens, sessions } from '@cindy/runtime-db/schema';
 import { throwIpcError } from '@cindy/remote-agent/ipcValidate';
@@ -464,6 +465,43 @@ async function addOrUpdateWorker(input: {
   const worker = workers.find((w) => w.id === input.id || w.sessionId === input.sessionId);
   if (!worker) throwIpcError('INTERNAL', `Orca worker ${input.id} was not found after save`);
   return worker;
+}
+
+/** Update a worker's display identity while preserving a generated session title. */
+async function updateWorkerIdentity(input: {
+  workerId: string;
+  role: string;
+  label: string | null;
+  previousRole: string;
+  previousLabel: string | null;
+}): Promise<{ ok: true } | { ok: false; errorCode: 'NOT_FOUND' | 'DUPLICATE_LABEL' }> {
+  const db = getDbClient().drizzle;
+  const now = Date.now();
+  const [existing] = await db
+    .select({ id: orcaWorkers.id, sessionId: orcaWorkers.sessionId })
+    .from(orcaWorkers)
+    .where(eq(orcaWorkers.id, input.workerId))
+    .limit(1);
+  if (!existing) return { ok: false, errorCode: 'NOT_FOUND' };
+
+  try {
+    await db.update(orcaWorkers).set({ role: input.role, label: input.label, updatedAt: now })
+      .where(eq(orcaWorkers.id, input.workerId));
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('uniq_orca_workers_team_label')) {
+      return { ok: false, errorCode: 'DUPLICATE_LABEL' };
+    }
+    throw err;
+  }
+
+  if (input.label !== null && input.previousLabel !== null) {
+    const previousTitle = orcaWorkerSessionTitle(input.previousRole, input.previousLabel);
+    const nextTitle = orcaWorkerSessionTitle(input.role, input.label);
+    const updated = await db.update(sessions).set({ title: nextTitle, updatedAt: now })
+      .where(and(eq(sessions.id, existing.sessionId), eq(sessions.title, previousTitle))).run();
+    if (updated.changes > 0) broadcastSessionPatch(existing.sessionId, { title: nextTitle });
+  }
+  return { ok: true };
 }
 
 async function listWorkersByLead(
@@ -980,6 +1018,7 @@ return { markWorkerIdle, listIdleReleaseCandidates, markIdleReleased, touchWorke
   reconcileInactiveTeamWorkersForLead,
   getTeamByWorkerSession,
   addOrUpdateWorker,
+  updateWorkerIdentity,
   listWorkersByLead,
   listWorkersByLeads,
   getWorkerLink,
