@@ -6494,6 +6494,55 @@ describe("Pi provider-aware model routing", () => {
     await handle.close();
   });
 
+  it("keeps the session context budget in settings.json across an image capability reload", async () => {
+    // 图片声明重写 settings.json 时必须带上 sessionContextWindowBudget：漏传会把逐模型
+    // compaction.modelOverrides 按模型自身窗口重算（fallback 16_384），任务级预算静默失效。
+    const declared = { image: false };
+    const deps = byomDeps(
+      async () => ({
+        providers: [
+          {
+            id: "native-budget",
+            name: "Native Budget",
+            baseUrl: "http://budget.test",
+            api: "openai-completions",
+            models: [{ id: "model-a", input: ["text"], contextWindow: 200_000 }],
+          },
+        ],
+        env: {},
+      }),
+    );
+    deps.runtimeConfig = { ...deps.runtimeConfig, piAutoCompactThresholdPct: 75 };
+    const agent = new PiAgent({
+      ...deps,
+      readModelImageInput: (providerId, modelId) =>
+        providerId === "native-budget" && modelId === "model-a" && declared.image
+          ? true
+          : undefined,
+    });
+    const handle = await agent.startSession({
+      sessionId: "image-reload-budget",
+      workingDir: cwd,
+      model: "model-a",
+      providerId: "native-budget",
+      contextWindowBudget: 50_000,
+    });
+    const settingsPath = path.join(captured.env.PI_CODING_AGENT_DIR!, "settings.json");
+    const readReserve = () =>
+      (JSON.parse(readFileSync(settingsPath, "utf8")) as {
+        compaction?: { modelOverrides?: Record<string, { reserveTokens?: number }> };
+      }).compaction?.modelOverrides?.["native-budget/model-a"]?.reserveTokens;
+    // 预算口径：200_000 - 50_000 × 75% = 162_500。
+    expect(readReserve()).toBe(162_500);
+
+    // 图片声明变更触发的对账重写 settings.json，预算不能被冲掉。
+    declared.image = true;
+    await handle.setModel!("model-a", { providerId: "native-budget" });
+    expect(captured.runtimeModel).toBe("model-a");
+    expect(readReserve()).toBe(162_500);
+    await handle.close();
+  });
+
   it("reapplies the session thinking level after an image capability reload reissues set_model", async () => {
     // reload 的 switch_session/set_model 会把思考档位重置成模型默认（pi CLI 行为），而重载
     // 路径不经过 switchModel 末尾的档位恢复 —— 发图触发的对账、同路由切模触发的对账早退后，

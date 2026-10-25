@@ -6703,6 +6703,9 @@ export class PiAgent extends BaseAgent {
           fileOps,
           contextWindow: ctx.contextWindow || startupContextWindow,
           workingContextWindow: ctx.workingContextWindow,
+          // 任务级预算必须随 settings.json 重写下发：漏传会把逐模型
+          // compaction.modelOverrides 按模型自身窗口重算，预算静默失效。
+          sessionContextWindowBudget,
           piCompactionPct: sessionPiAutoCompactPct,
           packages: nativePackagePaths,
           disabledSkills: disabledSkillLaunch,
@@ -7438,6 +7441,9 @@ export class PiAgent extends BaseAgent {
               fileOps,
               contextWindow: ctx.contextWindow || startupContextWindow,
               workingContextWindow: ctx.workingContextWindow,
+              // 任务级预算必须随 settings.json 重写下发：漏传会把逐模型
+              // compaction.modelOverrides 按模型自身窗口重算，预算静默失效。
+              sessionContextWindowBudget,
               piCompactionPct: sessionPiAutoCompactPct,
               packages: nativePackagePaths,
               disabledSkills: disabledSkillLaunch,
