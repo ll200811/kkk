@@ -465,7 +465,7 @@ describe('MakerScheduleRunner silent-run notification skip', () => {
   });
 
   it.each([true, false])(
-    'rewinds a fresh ordinary instruction cancelled before dispatch (silent=%s)',
+    'discards a fresh ordinary instruction cancelled before dispatch (silent=%s)',
     async (silentWhenIdle) => {
       const ctx = createFireContext();
       const controller = new AbortController();
@@ -480,6 +480,7 @@ describe('MakerScheduleRunner silent-run notification skip', () => {
       expect(mocks.rewind).toHaveBeenCalledExactlyOnceWith(
         h.session.id,
         mocks.createMessage.mock.calls[0][1].clientId,
+        { discard: true },
       );
       expect(notifier.notify).not.toHaveBeenCalled();
     },
@@ -507,6 +508,7 @@ describe('MakerScheduleRunner silent-run notification skip', () => {
     expect(mocks.rewind).toHaveBeenCalledExactlyOnceWith(
       h.session.id,
       mocks.createMessage.mock.calls[0][1].clientId,
+      { discard: true },
     );
     expect(notifier.notify).not.toHaveBeenCalled();
   });
