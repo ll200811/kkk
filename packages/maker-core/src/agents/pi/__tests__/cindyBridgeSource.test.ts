@@ -2358,7 +2358,10 @@ it('re-surfaces the disclosure set once after compaction instead of editing ever
   const text = note?.message?.content?.[0]?.text ?? '';
   expect(text).toContain('cindy_memory/call_tool');
   expect(text).toContain('cindy_orca/send_to_worker');
-  expect(text).toContain('do not re-run cindy_mcp_list_tools');
+  // 压缩可能模糊参数细节：提醒软化为「参数记得就直接调，模糊了按需重查」，
+  // 不再绝对化禁止重查（Greptile P2：否则模型只能猜参数或违背提醒）。
+  expect(text).toContain('Call them directly while you still remember their parameter shapes');
+  expect(text).toContain('re-inspect just the tools you need via cindy_mcp_list_tools instead of guessing');
   // One-shot: the second run after the same compaction stays clean.
   expect(handlers.get('before_agent_start')!({ systemPrompt: 'base' })).toBeUndefined();
 

@@ -3537,8 +3537,9 @@ class CindyMcpGateway {
           content: [{
             type: 'text',
             text: 'MCP tools whose schemas you already inspected for this session (persisted across restarts): '
-              + keys + '. Call them directly; do not re-run cindy_mcp_list_tools to re-inspect them. '
-              + '(One-shot reminder after context compaction.)',
+              + keys + '. Call them directly while you still remember their parameter shapes. If compaction '
+              + 'blurred the details, re-inspect just the tools you need via cindy_mcp_list_tools instead of '
+              + 'guessing parameters. (One-shot reminder after context compaction.)',
           }],
           display: false,
         },
