@@ -2393,10 +2393,6 @@ it('routes Bot shortcuts through the scoped helper entry without exposing them t
     createHash,
     recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
     mcpContentToPi: (content: unknown) => content,
-    // 披露门按 schema 指纹判定，CindyMcpGateway.schemaFingerprint 在沙箱里调
-    // createHash。少注入这一项，任何走 listResult/executeCall 的沙箱用例都会
-    // ReferenceError: createHash is not defined。
-    createHash,
   };
   runInNewContext(compiled, context);
   const calls: unknown[] = [];
@@ -2545,7 +2541,6 @@ it('lets cindy_mcp_call_tool omit args and forwards an empty object for no-param
     createHash,
     recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
     mcpContentToPi: (content: unknown) => content,
-    createHash,
   };
   runInNewContext(compiled, context);
   const requests: Array<{ method: string; params: any }> = [];
@@ -2605,10 +2600,6 @@ it('tells the model the call_tool envelope instead of forwarding a flattened env
     createHash,
     recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
     mcpContentToPi: (content: unknown) => content,
-    // 披露门按 schema 指纹判定，CindyMcpGateway.schemaFingerprint 在沙箱里调
-    // createHash。少注入这一项，任何走 listResult/executeCall 的沙箱用例都会
-    // ReferenceError: createHash is not defined。
-    createHash,
   };
   runInNewContext(compiled, context);
   const requests: Array<{ method: string; params: any }> = [];
@@ -2651,10 +2642,6 @@ it('does not apply the Cindy envelope rule to a third-party tool also named call
     createHash,
     recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
     mcpContentToPi: (content: unknown) => content,
-    // 披露门按 schema 指纹判定，CindyMcpGateway.schemaFingerprint 在沙箱里调
-    // createHash。少注入这一项，任何走 listResult/executeCall 的沙箱用例都会
-    // ReferenceError: createHash is not defined。
-    createHash,
   };
   runInNewContext(compiled, context);
   const requests: Array<{ method: string; params: any }> = [];
@@ -2716,10 +2703,6 @@ it('leaves a direct tool alone when its required name is not the Cindy envelope'
     createHash,
     recordInput: (value: unknown) => value && typeof value === 'object' ? value : {},
     mcpContentToPi: (content: unknown) => content,
-    // 披露门按 schema 指纹判定，CindyMcpGateway.schemaFingerprint 在沙箱里调
-    // createHash。少注入这一项，任何走 listResult/executeCall 的沙箱用例都会
-    // ReferenceError: createHash is not defined。
-    createHash,
   };
   runInNewContext(compiled, context);
   const requests: Array<{ method: string; params: any }> = [];
