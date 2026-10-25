@@ -370,12 +370,12 @@ it('runs original cloud direct-room delivery and fences late network replies whe
   schedulers.push(scheduler);f.host.routines=new TerminalCompanionRoutines(f.host,scheduler);await f.host.routines.open();
   const self='30000000-0000-4000-8000-000000000001',actor='20000000-0000-4000-8000-000000000001';
   const room='10000000-0000-4000-8000-000000000001',source='50000000-0000-4000-8000-000000000001',executionId='40000000-0000-4000-8000-000000000001';
-  let home:string|null=null,claimed=false,holdHistory=false,late:ServerResponse|undefined;
+  let home:string|null=null,claimed=false,holdHistory=false,late:ServerResponse|undefined,endpointUrl='';
   const calls:Array<{route:string;method:string;body:any}>=[],preferences=new Map<string,{key:string;value:unknown;revision:number}>();
   const send=(res:ServerResponse,value:unknown)=>{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(value));};
   const server=createServer((req,res)=>{void(async()=>{
     const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
-    const url=new URL(req.url!,'http://127.0.0.1:3018'),route=url.pathname.slice(3),method=req.method!,body=chunks.length?JSON.parse(Buffer.concat(chunks).toString()):undefined;
+    const url=new URL(req.url!,endpointUrl),route=url.pathname.slice(3),method=req.method!,body=chunks.length?JSON.parse(Buffer.concat(chunks).toString()):undefined;
     calls.push({route,method,body});
     expect(req.headers.authorization).toBe('Bearer isolated-cloud-token');
     if(route==='/me')return send(res,{actor:{id:self,kind:'human'},deviceId:'node-fixture',capabilities:{companionHome:true,directRoomClaim:true}});
@@ -395,10 +395,10 @@ it('runs original cloud direct-room delivery and fences late network replies whe
     return send(res,{});
   })().catch(error=>{res.writeHead(500);res.end(JSON.stringify({error:{code:String(error)}}));});});
   server.on('upgrade',(_req,socket)=>socket.destroy());
-  await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(3018,'127.0.0.1',resolve);});
+  await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',()=>{const address=server.address();if(!address||typeof address==='string')return reject(new Error('HTTP_FIXTURE_ADDRESS_UNAVAILABLE'));endpointUrl=`http://127.0.0.1:${address.port}`;resolve();});});
   vi.stubEnv('XDT_ISOLATED','1');vi.useFakeTimers({toFake:['setInterval','clearInterval']});
   const cloud=new TerminalCompanionCloud({host:f.host,routines:f.host.routines,userDataPath:f.root,
-    endpoint:()=> 'http://127.0.0.1:3018',getToken:()=> 'isolated-cloud-token',refresh:async()=>false,
+    endpoint:()=> endpointUrl,getToken:()=> 'isolated-cloud-token',refresh:async()=>false,
     remoteControlEnabled:()=>true,guard:()=>f.host.options.guard(),logger,deviceId:'node-fixture',locale:()=> 'en',
     listDevices:async()=>[],remoteInvoke:async()=>{throw new Error('NO_REMOTE_FIXTURE');},emit(){}});
   try{

@@ -327,6 +327,13 @@ function withChatServer(local: BotGroupChatService, deps: BotGroupChatServiceDep
 function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceDeps, config: { baseUrl: string }): BotGroupChatService {
   const scope = deps.captureOwnerScope?.();
   let disposed = false;
+  const isolatedLoopback = (() => {
+    if (isPackaged() || process.env.XDT_ISOLATED !== '1') return false;
+    try {
+      const url = new URL(config.baseUrl);
+      return url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+    } catch { return false; }
+  })();
   // Demotion persisted for this owner applies before the server has answered.
   if (deps.companionCloud?.shadows) deps.companionCloud.homes.setPersistedShadows(deps.companionCloud.shadows.read());
   // What is on disk: a failed write is retried on the next publish, not taken as saved.
@@ -526,7 +533,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     if (!current()) return Promise.reject(new Error('OWNER_CHANGED'));
     if (!config.baseUrl) return Promise.reject(new Error('CHAT_ENDPOINT_UNAVAILABLE'));
     const url = new URL(`${config.baseUrl}/v1${route}`);
-    if (url.protocol !== 'https:' && (isPackaged() || url.origin !== 'http://127.0.0.1:3018')) return Promise.reject(new Error('INVALID_CHAT_ENDPOINT'));
+    if (url.protocol !== 'https:' && !isolatedLoopback) return Promise.reject(new Error('INVALID_CHAT_ENDPOINT'));
     const token = getAccessToken();
     if (!token) return Promise.reject(new Error('AUTH_REQUIRED'));
     const started = Date.now();
@@ -580,7 +587,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
       throw error;
     });
   }
-  const media = createChatMedia(api, current, deps.log, { allowLoopback: !isPackaged() && process.env.XDT_ISOLATED === '1' && config.baseUrl === 'http://127.0.0.1:3018' });
+  const media = createChatMedia(api, current, deps.log, { allowLoopback: isolatedLoopback });
   const threads = createThreadProjection<Message>({
     threadPage: (roomId, rootId, limit, before) => api<Message[]>(`/conversations/${roomId}/messages?threadRootId=${rootId}&limit=${limit}${before ? `&before=${before}` : ''}`),
     // The same visibility rule as every other single-message read.
