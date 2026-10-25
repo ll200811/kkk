@@ -31,6 +31,7 @@ import { getMobileNotifyGeneration, sendMobileSessionNotify } from './device-lin
 import { notificationPreview } from './notificationPreview';
 import { companionAvatarThumbnail } from './agent-island/companionIdentity';
 import { getDeepLinkMainWindow, openMainWindowChatMessage } from './deepLink';
+import { isSessionNotificationsMutedSync } from './localDb/sessionFlagRegistry';
 import type { ChatMessageNotification } from './maker-ipc/chatMessageNotifications';
 import { readSessionNotificationPreview, type SessionNotificationPreview } from './localDb/sessionNotificationPreview';
 import { drainSessionActiveTurnWrites, getSessionNotificationTurnSignal } from './localDb/sessionActiveTurn';
@@ -214,7 +215,12 @@ export function showDesktopSessionEvent(
   },
 ): boolean {
   const { sessionId, title, kind } = payload;
-  if (sessionId && payload.markAttention !== false) markSessionNeedsAttention(sessionId);
+  const isLocalSession = !!sessionId && payload.markAttention !== false;
+  if (isLocalSession) markSessionNeedsAttention(sessionId);
+  // 「消息免打扰」门放在这个**公共出口**上：scheduler、伙伴自主跟进等 main 内
+  // 直接调用方都不经过 IPC handler 的那道判定，只挡 handler 会漏出系统 toast。
+  // 其它设备的任务（markAttention === false）不查本机静音标记。
+  if (isLocalSession && isSessionNotificationsMutedSync(sessionId)) return false;
   const safeTitle = title?.trim() || sessionId.slice(0, 8) || getSessionNotificationUntitled();
   return showDesktopToast(safeTitle, kind, () => focusWindow(getWindow, sessionId), payload.body, payload.teammate, payload.avatarJpeg);
 }
@@ -279,6 +285,9 @@ export function initNotificationService(deps: NotificationServiceDeps): void {
       const wantDesktop = channels?.desktop ?? true;
       const wantFeishu = channels?.feishu === true;
       if (markAttention) markSessionNeedsAttention(sessionId);
+      // 「消息免打扰」任务不再走任何外向提醒通道（系统 toast / 灵动岛 / 手机 / 飞书）；
+      // 未读与角标已在上一行照常记账，任务内的提醒不受影响。
+      if (isSessionNotificationsMutedSync(sessionId)) return;
 
       // Content is read from main's transcript. Bound only enrichment, not delivery;
       // a timeout is not a dedupe window and never causes a second late toast.
@@ -376,6 +385,9 @@ export function initNotificationService(deps: NotificationServiceDeps): void {
           const afterHandoffSignal = getSessionNotificationTurnSignal(sessionId);
           if (afterHandoffSignal?.id !== signal?.id || (afterHandoffSignal && !afterHandoffSignal.ended)) return;
         }
+        // 取正文 / 等交接判定期间用户可能刚开了免打扰:真正发之前再确认一次。
+        // 手机通道在 sendMobileSessionNotify 内另有同一道门。
+        if (isSessionNotificationsMutedSync(sessionId)) return;
         if (kind === 'done' && handledByTeammate) {
           // Consume this event in the existing per-channel ledger. Removing a
           // delegation later must not replay a completion already handed off.
