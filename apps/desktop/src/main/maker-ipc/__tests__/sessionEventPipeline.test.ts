@@ -2274,7 +2274,8 @@ it('captures task completion inputs before queue advancement and binds only a su
   });
   effects.fn('consumeLastTopLevelAssistantPersistId').mockReturnValueOnce('summary');
   h.emit(event('done', { status: 'completed', result: 'Summary' }));
-  expect(effects.fn('markAssistantTurnCompleted')).toHaveBeenCalledWith('task', 'summary', undefined, ['bot-delegation-completion:a']);
+  expect(effects.fn('markAssistantTurnCompleted')).toHaveBeenCalledWith('task', 'summary', undefined,
+    ['bot-delegation-completion:a'], ['bot-delegation-completion:a', 'human']);
   await h.dispose();
 });
 
