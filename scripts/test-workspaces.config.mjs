@@ -533,6 +533,7 @@ export default {
     noCollectableWorkspace('@cindy/companion-core', 'packages/companion-core', 'Shared companion behavior is exercised through Desktop and terminal host integration tests.'),
     noCollectableWorkspace('@cindy/im-runtime', 'packages/im-runtime', 'Shared IM behavior retains its Desktop characterization tests and terminal host integration coverage.'),
     noCollectableWorkspace('@cindy/media-core', 'packages/media-core', 'Shared media behavior is covered through Desktop and terminal host consumers.'),
+    noCollectableWorkspace('@cindy/app-runtime', 'packages/app-runtime', 'Shared headless runtime behavior is exercised through the Cindy headless and terminal hosts.'),
     noCollectableWorkspace('@cindy/remote-agent', 'packages/remote-agent', 'Shared remote execution is covered through Desktop and terminal host consumers.'),
     noCollectableWorkspace('@cindy/terminal-core', 'packages/terminal-core', 'Shared PTY behavior is covered through Desktop and terminal platform acceptance.'),
     {
