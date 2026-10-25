@@ -1173,6 +1173,7 @@ import {
   getDesktopSelectableCatalog,
   refreshActiveCatalogFromSource,
   refreshCustomProvidersIntoCatalog,
+  syncLocalCatalogOverridesIntoActiveCatalog,
 } from '../maker-host/createDesktopProviderService.js';
 import {
   deviceAvailableModels,
@@ -1199,6 +1200,12 @@ import {
   writeModelContextLimitsWithRefresh,
 } from '../maker-host/model-context-limit-store.js';
 import { refreshAnthropicModelsFromProbe } from '../maker-host/model-discovery/anthropic.js';
+import {
+  readModelCatalogImageInput,
+  readModelCatalogThinking,
+  setModelCatalogThinking,
+  setModelCatalogImageInput,
+} from '../maker-host/model-catalog-override-store.js';
 import { refreshOpenAiMediaModels } from '../maker-host/model-discovery/openai-media.js';
 import { refreshXaiMediaModels } from '../maker-host/model-discovery/xai-media.js';
 import { testProviderConnection } from '../maker-host/provider-diagnostics.js';
@@ -7588,6 +7595,38 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         target.modelId,
       ),
     }),
+    readModelCatalogThinking: (target) =>
+      readModelCatalogThinking({
+        providerId: target.providerId,
+        modelId: target.modelId,
+        agent: target.agent,
+      }),
+    writeModelCatalogThinking: async (targets, tiers, defaultEffort) => {
+      await setModelCatalogThinking(
+        targets.map((target) => ({
+          providerId: target.providerId,
+          modelId: target.modelId,
+        })),
+        tiers,
+        defaultEffort,
+      );
+    },
+    readModelCatalogImageInput: (target) =>
+      readModelCatalogImageInput({
+        providerId: target.providerId,
+        modelId: target.modelId,
+        agent: target.agent,
+      }),
+    writeModelCatalogImageInput: async (targets, value) => {
+      await setModelCatalogImageInput(
+        targets.map((target) => ({
+          providerId: target.providerId,
+          modelId: target.modelId,
+        })),
+        value,
+      );
+    },
+    syncLocalCatalogOverrides: () => syncLocalCatalogOverridesIntoActiveCatalog(),
     validateModelContextLimit: async (targets, limit) => {
       const localTargets = targets.filter((target) => target.providerId === MANAGED_LLAMACPP_PROVIDER_ID);
       if (localTargets.length) {
