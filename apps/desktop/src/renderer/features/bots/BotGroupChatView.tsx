@@ -1,3 +1,4 @@
+import { copyChatSelection } from '@/components/chat/chatSelectionClipboard';
 import { RemoveChatFromListButton } from './RemoveChatFromListButton';
 import { useThreadPanelResize } from './useThreadPanelResize';
 import { cn } from '@/lib/utils';
@@ -1179,6 +1180,7 @@ function BotGroupChatContent({ groupId, direct }: { groupId: string; direct: boo
       <div
         ref={scrollRef}
         data-testid="bot-group-timeline"
+        onCopy={copyChatSelection}
         onScroll={(event) => {
           const element = event.currentTarget;
           if (stickToBottomRef.current) setSeenThrough(latestSequenceRef.current);
