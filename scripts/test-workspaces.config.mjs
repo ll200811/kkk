@@ -534,6 +534,8 @@ export default {
     noCollectableWorkspace('@cindy/im-runtime', 'packages/im-runtime', 'Shared IM behavior retains its Desktop characterization tests and terminal host integration coverage.'),
     noCollectableWorkspace('@cindy/media-core', 'packages/media-core', 'Shared media behavior is covered through Desktop and terminal host consumers.'),
     noCollectableWorkspace('@cindy/app-runtime', 'packages/app-runtime', 'Shared headless runtime behavior is exercised through the Cindy headless and terminal hosts.'),
+    noCollectableWorkspace('@cindy/runtime-db', 'packages/runtime-db', 'Shared database runtime behavior is exercised through the Desktop and terminal host consumers.'),
+    noCollectableWorkspace('@cindy/worktree-core', 'packages/worktree-core', 'Shared worktree behavior is exercised through the Desktop and terminal host consumers.'),
     noCollectableWorkspace('@cindy/remote-agent', 'packages/remote-agent', 'Shared remote execution is covered through Desktop and terminal host consumers.'),
     noCollectableWorkspace('@cindy/terminal-core', 'packages/terminal-core', 'Shared PTY behavior is covered through Desktop and terminal platform acceptance.'),
     {
