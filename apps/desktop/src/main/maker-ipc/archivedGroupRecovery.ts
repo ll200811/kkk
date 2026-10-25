@@ -2,12 +2,13 @@ import { archivedGroupRestore, type ArchivedGroupRequest, type CurrentGroupResul
 import { chatGroupRolePermissions } from '@cindy/maker-shared/botGroupPresentation';
 
 type Recovery = (botId: string, request: ArchivedGroupRequest, validate: () => Promise<void>) => Promise<CurrentGroupResult>;
-let recovery: Recovery | undefined;
+let recovery: { execute: Recovery; refresh?: () => void } | undefined;
 
 /** Account-scoped Chat Server lifecycle, not an execution grant or persisted lane. */
-export function registerArchivedGroupRecovery(handler: Recovery): () => void {
-  recovery = handler;
-  return () => { if (recovery === handler) recovery = undefined; };
+export function registerArchivedGroupRecovery(handler: Recovery, refresh?: () => void): () => void {
+  const registration = { execute: handler, refresh };
+  recovery = registration;
+  return () => { if (recovery === registration) recovery = undefined; };
 }
 
 interface Room { id: string; name: string; kind?: string; archived: boolean; revision: number; dissolved_at?: string | null }
@@ -107,6 +108,9 @@ export async function executeArchivedGroupTool(sessionId: string, request: Archi
   caller(sessionId: string): Promise<Caller | null>;
   input(sessionId: string): Input;
 }): Promise<CurrentGroupResult> {
+  // Settle the lazy account/endpoint wrapper before capturing a grant. This
+  // may dispose the old registration and install the current account's one.
+  recovery?.refresh?.();
   const handler = recovery;
   const input = deps.input(sessionId);
   let botId: string | undefined;
@@ -126,7 +130,7 @@ export async function executeArchivedGroupTool(sessionId: string, request: Archi
   };
   try {
     await validate();
-    return await handler!(botId!, request, validate);
+    return await handler!.execute(botId!, request, validate);
   } catch {
     return { ok: false, errorCode: 'GROUP_AUTHORIZATION_REQUIRED', message: 'Archived group recovery requires a current request from your owner in your private Bot Chat.' };
   }

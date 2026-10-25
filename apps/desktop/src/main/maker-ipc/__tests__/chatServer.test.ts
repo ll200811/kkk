@@ -675,7 +675,7 @@ describe('Chat Server result delivery and refresh', () => {
     const call = (action: import('@cindy/mcps').CurrentGroupMutation['action'], guard = () => {}) =>
       executeCurrentGroupTool('lane', { type: 'manage', mutation: { operationId, action } }, guard);
     const writes = () => fixture.handle.mock.calls.filter(([, method, body]) => method !== 'GET' && body?.operationId === operationId);
-    async function setup(botRole = 'owner', requester = selfId, requesterRole = 'member') {
+    async function setup(botRole = 'owner', requester = selfId, requesterRole = 'member', capabilities = {}) {
       group = room(roomId);
       const member = (id: string, kind: string, role: string, ownerActorId = id) => ({ id, kind, name: id, state: 'joined', role, ownerActorId, guestAccess: 'tools', accessRevision: 1 });
       members = [member(botId, 'bot', botRole, selfId), member(selfId, 'human', requester === selfId ? requesterRole : 'owner'), member(peerId, 'bot', 'member', outsiderId)];
@@ -683,7 +683,7 @@ describe('Chat Server result delivery and refresh', () => {
       mutate = () => ({ body: { revision: 2 } });
       fixture.requests = [];
       fixture.handle.mockImplementation((route, method, body) => {
-        if (route === '/me') return { body: { actor: { id: selfId }, capabilities: { groupLifecycleVersion: 1 } } };
+        if (route === '/me') return { body: { actor: { id: selfId }, capabilities: { groupLifecycleVersion: 1, ...capabilities } } };
         if (route === '/executions/claim') { const next = claimed ? null : { ...execution, requester_id: requester, access_mode: requester === selfId ? 'owner' : 'tools' }; claimed = true; return { body: { execution: next } }; }
         if (route.endsWith('/members') && method === 'GET') return { body: members };
         if (route.endsWith('/snapshot')) return { body: { room: group, members, messages: [], cursor: '1' } };
@@ -852,6 +852,83 @@ describe('Chat Server result delivery and refresh', () => {
         expect(restored[0][2]).toEqual({ operationId: request.mutation.operationId, archived: false, expectedRevision: 2 });
         expect(fixture.requests.filter(r => new URL(r.url).pathname === '/v1/conversations/' + roomId).at(-1)?.actor).toBe(botId);
       }
+    });
+    // #6944 review regressions (unit): live tool entries, not callback spies.
+    // Existing tests never overlap a bot plan action with a deferred planner or
+    // call private recovery first after an account/endpoint change.
+    it.each(['stop', 'dismiss', 'revoke-during-cancel'] as const)('retires an old planner before bot plan management: %s', async mode => {
+      await setup('owner', selfId, 'member', { groupDiscussionParity: 1 });
+      const planId = '80000000-0000-4000-8000-000000000001';
+      const sourceId = '50000000-0000-4000-8000-000000000099';
+      let decide!: (value: { needsPlan: boolean; steps: Array<{ botId: string; task: string }> }) => void;
+      let signal!: AbortSignal;
+      deps.decidePlan = vi.fn<NonNullable<typeof deps.decidePlan>>((_input, abort) => {
+        signal = abort; return new Promise(resolve => { decide = resolve; });
+      });
+      const original = fixture.handle.getMockImplementation()!;
+      let finishCancel!: () => void;
+      fixture.handle.mockImplementation((route, method, body) => {
+        if (route.endsWith('/messages') && method === 'POST') return { body: { id: sourceId } };
+        if (route.endsWith('/cancel-planning')) return new Promise(resolve => { finishCancel = () => resolve({ body: {} }); });
+        if (route.includes('/plans?ids=')) return { body: [{ id: planId, revision: 1, status: 'waiting' }] };
+        return original(route, method, body);
+      });
+      expect(await service.sendMessage({ groupId: roomId, text: 'Arrange this', clientId: 'planner-race', mentions: { all: false, botIds: [] } })).toMatchObject({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deps.decidePlan).toHaveBeenCalledOnce();
+      const pending = call({ type: 'plan', planId, expectedRevision: 1, action: mode === 'dismiss' ? 'dismiss' : 'stop' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(signal.aborted).toBe(true);
+      expect(finishCancel).toBeTypeOf('function');
+      expect(writes()).toHaveLength(0);
+      if (mode === 'revoke-during-cancel') members[0].role = 'member';
+      finishCancel();
+      expect(await pending).toMatchObject(mode === 'revoke-during-cancel' ? { ok: false, errorCode: 'GROUP_ROLE_REQUIRED' } : { ok: true });
+      decide({ needsPlan: mode !== 'dismiss', steps: [{ botId, task: 'Stale work' }] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fixture.handle.mock.calls.filter(([route, method]) => method === 'POST' && (route.endsWith('/plans') || route.endsWith('/continue')))).toHaveLength(0);
+      expect(writes()).toHaveLength(mode === 'revoke-during-cancel' ? 0 : 1);
+    });
+    it.each(['account', 'endpoint'] as const)('refreshes private recovery before its first call after changing %s', async mode => {
+      let generation = 0;
+      deps.captureOwnerScope = () => ({ generation }) as unknown as ReturnType<NonNullable<typeof deps.captureOwnerScope>>;
+      deps.isOwnerScopeCurrent = scope => (scope as unknown as { generation: number }).generation === generation;
+      service.dispose();
+      service = withChatServer({ listGroups: async () => ({ ok: true, groups: [] }), dispose: vi.fn() } as unknown as BotGroupChatService, deps);
+      await setup();
+      group.archived = true; group.revision = 2;
+      const original = fixture.handle.getMockImplementation()!;
+      fixture.handle.mockImplementation((route, method, body) => {
+        if (route.startsWith('/conversations?')) return { body: [{ ...group, state: 'joined' }] };
+        if (method === 'PATCH' && body?.archived === false) { group.archived = false; return { body: { revision: 3 } }; }
+        return original(route, method, body);
+      });
+      const recoveryDeps = {
+        caller: async () => ({ botId: 'local-bot', source: 'bot', role: 'canonical', status: 'active', botStatus: 'active', archivedAt: null, remoteHostId: null }),
+        input: () => ({ key: 'fresh-private-input', boundary: String(generation), ownerInput: true, permission: { planModeEnabled: false, isCurrent: () => true } }),
+      };
+      // A response already in flight belongs to the old binding and must not
+      // become usable merely because the new account's recovery now works.
+      const beforeSwitch = fixture.handle.getMockImplementation()!;
+      let finishOldRead!: () => void;
+      fixture.handle.mockImplementation((route, method, body) => {
+        if (route.endsWith('/snapshot') && !finishOldRead) return new Promise(resolve => {
+          finishOldRead = () => resolve({ body: { room: group, members, messages: [], cursor: '1' } });
+        });
+        return beforeSwitch(route, method, body);
+      });
+      const oldRead = executeArchivedGroupTool('private-chat', { type: 'list-archived' }, recoveryDeps);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(finishOldRead).toBeTypeOf('function');
+      if (mode === 'account') generation++;
+      else fixture.exists.mockReturnValue(false);
+      // No UI/service getter between the boundary change and this tool call.
+      expect(await executeArchivedGroupTool('private-chat', { type: 'list-archived' }, recoveryDeps)).toMatchObject({ ok: true, groups: [{ id: roomId, revision: 2 }] });
+      expect(await executeArchivedGroupTool('private-chat', { type: 'restore-archived', mutation: { groupId: roomId, expectedRevision: 2, operationId } }, recoveryDeps)).toMatchObject({ ok: true });
+      finishOldRead();
+      expect(await oldRead).toMatchObject({ ok: false, errorCode: 'OWNER_CHANGED' });
+      expect(fixture.requests.at(-1)?.url).toContain(mode === 'endpoint' ? 'https://chat.cindy.app' : 'http://127.0.0.1:3018');
+      expect(await executeArchivedGroupTool('private-chat', { type: 'list-archived' }, { ...recoveryDeps, input: () => ({ ...recoveryDeps.input(), ownerInput: false }) })).toMatchObject({ ok: false, errorCode: 'GROUP_AUTHORIZATION_REQUIRED' });
     });
     it.each([401, 403, 500])('does not automatically replay a management write after HTTP %s', async status => {
       await setup();

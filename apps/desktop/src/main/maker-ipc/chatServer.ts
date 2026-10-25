@@ -295,13 +295,13 @@ export function withChatServer(local: BotGroupChatService, deps: BotGroupChatSer
   };
   let baseUrl = endpoint();
   let activeScope = deps.captureOwnerScope?.();
-  let active = createChatServer(local, deps, { baseUrl });
+  let active = createChatServer(local, deps, { baseUrl, refreshRecovery: () => { service(); } });
   const service = () => {
     if (baseUrl !== endpoint() || (activeScope && deps.isOwnerScopeCurrent && !deps.isOwnerScopeCurrent(activeScope))) {
       active.dispose();
       baseUrl = endpoint();
       activeScope = deps.captureOwnerScope?.();
-      active = createChatServer(local, deps, { baseUrl });
+      active = createChatServer(local, deps, { baseUrl, refreshRecovery: () => { service(); } });
     }
     return active;
   };
@@ -328,7 +328,7 @@ export function withChatServer(local: BotGroupChatService, deps: BotGroupChatSer
   };
 }
 
-function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceDeps, config: { baseUrl: string }): BotGroupChatService {
+function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceDeps, config: { baseUrl: string; refreshRecovery: () => void }): BotGroupChatService {
   const scope = deps.captureOwnerScope?.();
   let disposed = false;
   // Demotion persisted for this owner applies before the server has answered.
@@ -1908,6 +1908,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
               return api(route, method, payload, actorId, method !== undefined && method !== 'GET', 200);
             },
             changed: () => changed(s.room.id), inviteToken, ownedBots,
+            replacePlanIntent: () => replacePlanIntent(s.room.id),
             executionStopped: async executionId => {
               const stopped = running.get(executionId);
               if (!stopped || stopped.execution.conversation_id !== s.room.id) return;
@@ -2797,7 +2798,7 @@ function createChatServer(local: BotGroupChatService, deps: BotGroupChatServiceD
     // Same bot actor and existing PATCH contract; never account managementActor.
     restore: (groupId, actorId, payload) => api(`/conversations/${id.parse(groupId)}`, 'PATCH', payload, actorId, true, 200),
     changed,
-  }));
+  }), config.refreshRecovery);
   return {
     chatServer,
     listGroups: () => safe(async () => {

@@ -19,6 +19,7 @@ interface Dependencies {
   changed(): void;
   inviteToken(link: string): string;
   ownedBots(): Promise<Array<{ actorId: string; botId: string; name: string }>>;
+  replacePlanIntent(): Promise<unknown>;
   executionStopped(executionId: string): Promise<void>;
   reconcileExecutions(): Promise<void>;
 }
@@ -109,6 +110,10 @@ export function createCurrentGroupManagement(deps: Dependencies) {
       if (unknownResult) throw new Error('GROUP_RESULT_UNKNOWN');
       if (previous?.result.ok) return previous.result;
       check();
+      // Retire the old planner and release its deferred source before plan
+      // reads/writes (including an identical retry), like the human controls.
+      // The final context check below also covers revocation during cancellation.
+      if (action.type === 'plan') await deps.replacePlanIntent();
       let route = roomPath; let method = 'POST'; let payload: Record<string, unknown>;
       if (replay) ({ route, method, payload } = replay);
       else switch (action.type) {
