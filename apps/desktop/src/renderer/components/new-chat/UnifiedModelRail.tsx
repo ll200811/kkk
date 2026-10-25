@@ -1,5 +1,7 @@
 import type { ReactNode } from 'react';
-import { LayoutGrid, Star } from 'lucide-react';
+import { isProviderShareAgentDeviceId } from '../../../shared/providerShare';
+import { useProviderShareWeeklyQuota } from '@/features/provider-share/useProviderShareWeeklyQuota';
+import { History, LayoutGrid, Star } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import type { ProviderView } from '@cindy/model-providers';
@@ -8,7 +10,11 @@ import { cn } from '@/lib/utils';
 import { providerAccountLabel } from '@/lib/providerDisplayName';
 import { Tip } from '@/components/ui/tooltip';
 
-import { useProviderWeeklyQuota, type ProviderUsageScope } from './useProviderWeeklyQuota';
+import {
+  useProviderWeeklyQuota,
+  type ProviderGroupUsageOf,
+  type ProviderUsageScope,
+} from './useProviderWeeklyQuota';
 import { formatQuotaResetCountdown } from '../status/usageCardModel';
 import { agentOptionOf } from './agentOptions';
 import { ProviderRailMark } from './UnifiedFlyoutHost';
@@ -24,7 +30,7 @@ import {
  * UnifiedModelRail —— 统一面板左侧的视图筛选栏(model-selector-unified §1.2 / §1.6)。
  *
  * 格位由数据派生(见 `buildUnifiedRail`),这里只负责画:
- *   ★收藏 → 同引擎(仅会话内,图标 = 当前会话引擎的品牌 mark)→ ──分隔── → 全部 → 各来源
+ *   最近 → ★收藏 → 同引擎(仅会话内,图标 = 当前会话引擎的品牌 mark)→ ──分隔── → 全部 → 各来源
  *   → (新任务草稿)──分隔── → 其他电脑上的供应商(带信号波纹的 Logo,每台电脑一段)。
  * rail 常驻(2026-08-13 裁决),分隔线与设计稿 .rail-sep 同构:「个人钉的」与
  * 「目录本身的视图」两段之间画一条 22px 细线。
@@ -37,6 +43,7 @@ export function UnifiedModelRail({
   providerLabel,
   interactionDisabled = false,
   providerUsage = null,
+  providerGroupUsage,
   remoteSources,
 }: {
   items: readonly UnifiedRailItem[];
@@ -47,12 +54,16 @@ export function UnifiedModelRail({
   interactionDisabled?: boolean;
   /** Whose account usage the directory may show; null hides it. */
   providerUsage?: ProviderUsageScope | null;
+  /** 供应商组那一格的用量读谁(provider-groups.md §10);缺省 = 都按格所在目录读。 */
+  providerGroupUsage?: ProviderGroupUsageOf;
   /**
-   * 远程供应商格的数据(只有可选远程 Agent 的新任务草稿传)。传了它,本机供应商格的
-   * 图标 / 名字 / 用量一律按本机读 —— 面板此刻可能正列着某台电脑的目录。
+   * 可选远程 Agent 的供应商格。localProviders 属于任务所在电脑，远控时未必是控制端本机；
+   * 图标 / 名字 / 用量都跟随该电脑，不随面板正在浏览的目录切换。
    */
   remoteSources?: {
     localProviders: readonly ProviderView[];
+    /** localProviders 所在电脑；null / 缺省 = 控制端本机。 */
+    localUsageDeviceId?: string | null;
     localProviderLabel: (providerId: string) => string;
     providersOf: (deviceId: string) => readonly ProviderView[];
     labelOf: (deviceId: string, providerId: string) => string;
@@ -86,28 +97,53 @@ export function UnifiedModelRail({
           item.kind === 'provider' || item.kind === 'remote-provider'
             ? railProviders.find((entry) => entry.id === item.providerId)
             : undefined;
-        // 用量跟随该格目录的归属:远程格读那台电脑的镜像,本机格在远程 Agent 模式下恒读本机。
+        // 普通格读任务所在电脑，远程格读指定电脑；两者都不借用当前浏览目录的归属。
         const usageDeviceId =
           item.kind === 'remote-provider'
             ? item.deviceId
             : remoteSources
-              ? null
+              ? (remoteSources.localUsageDeviceId ?? null)
               : (providerUsage?.deviceId ?? null);
+        // 供应商组那一格代表组里的几台电脑：任务正经组在某台运行时读那台的账号(与输入框下方的用量
+        // 一致)，还没分到电脑时不显示某一台的配额；悬停多写一句说明是哪台。
+        const groupUsage =
+          provider && (item.kind === 'provider' || item.kind === 'remote-provider')
+            ? (providerGroupUsage?.(
+                item.kind === 'remote-provider' ? item.deviceId : null,
+                item.providerId,
+              ) ?? null)
+            : null;
+        const usageProvider = groupUsage
+          ? groupUsage.kind === 'running'
+            ? groupUsage.usage?.provider
+            : undefined
+          : provider;
         const accountIdentity =
-          provider?.openAiAccount?.identity?.trim() ||
-          provider?.subscriptionAccount?.identity?.trim();
-        const label =
-          item.kind === 'favorites'
-            ? t('newChat.modelSelector.unified.railFavorites')
-            : item.kind === 'engine'
-              ? t('newChat.modelSelector.unified.railSameEngine', {
-                  agent: engineOption?.label ?? '',
+          usageProvider?.openAiAccount?.identity?.trim() ||
+          usageProvider?.subscriptionAccount?.identity?.trim();
+        const groupNote = groupUsage
+          ? groupUsage.kind !== 'running'
+            ? t('newChat.modelSelector.unified.providerGroupUnassigned')
+            : groupUsage.deviceName === null
+              ? t('newChat.modelSelector.unified.providerGroupRunningHere')
+              : t('newChat.modelSelector.unified.providerGroupRunningOn', {
+                  device: groupUsage.deviceName,
                 })
-              : item.kind === 'all'
-                ? t('newChat.modelSelector.unified.railAll')
-                : item.kind === 'remote-provider'
-                  ? (remoteSources?.labelOf(item.deviceId, item.providerId) ?? item.providerId)
-                  : (remoteSources?.localProviderLabel ?? providerLabel)(item.providerId);
+          : undefined;
+        const label =
+          item.kind === 'recent'
+            ? t('newChat.modelSelector.unified.railRecent')
+            : item.kind === 'favorites'
+              ? t('newChat.modelSelector.unified.railFavorites')
+              : item.kind === 'engine'
+                ? t('newChat.modelSelector.unified.railSameEngine', {
+                    agent: engineOption?.label ?? '',
+                  })
+                : item.kind === 'all'
+                  ? t('newChat.modelSelector.unified.railAll')
+                  : item.kind === 'remote-provider'
+                    ? (remoteSources?.labelOf(item.deviceId, item.providerId) ?? item.providerId)
+                    : (remoteSources?.localProviderLabel ?? providerLabel)(item.providerId);
         return (
           <div key={key} className="contents">
             {separatorBefore && (
@@ -117,16 +153,31 @@ export function UnifiedModelRail({
               />
             )}
             <RailButton
+              shareDeviceId={
+                (item.kind === 'provider' || item.kind === 'remote-provider') &&
+                isProviderShareAgentDeviceId(usageDeviceId)
+                  ? usageDeviceId
+                  : null
+              }
               label={label}
               accountIdentity={accountIdentity}
+              {...(groupNote ? { groupNote } : {})}
               isActive={isActive}
               itemKey={key}
               onClick={() => onSelect(item)}
               disabled={interactionDisabled}
-              provider={providerUsage ? provider : undefined}
-              usageDeviceId={usageDeviceId}
+              provider={providerUsage ? usageProvider : undefined}
+              usageDeviceId={
+                groupUsage?.kind === 'running' && groupUsage.usage
+                  ? groupUsage.usage.scope.deviceId
+                  : usageDeviceId
+              }
             >
-              {item.kind === 'favorites' ? (
+              {item.kind === 'recent' ? (
+                // 最近格用 History(时钟 + 回拨箭头)表达「用过的时间序」,与 ★ 的「钉住」
+                // 语义区分;与其它非激活格同灰,hover 提亮,不抢视线。
+                <History size={16} />
+              ) : item.kind === 'favorites' ? (
                 // ☆ 未激活与其它格同灰(hover 提亮)—— 常亮金色会在没进收藏视图时也
                 // 抢视线(2026-08-14 实机自查);激活时整格反色 + 实心星跟随 currentColor。
                 <Star size={16} fill={isActive ? 'currentColor' : 'none'} />
@@ -154,23 +205,34 @@ export function UnifiedModelRail({
 interface RailButtonProps {
   label: string;
   accountIdentity?: string;
+  /** 供应商组那一格:用量读的是哪台(或还没分到电脑),账号名跟在这一句后面。 */
+  groupNote?: string;
   isActive: boolean;
   itemKey: string;
   onClick: () => void;
   disabled: boolean;
   provider?: ProviderView;
   usageDeviceId: string | null;
+  shareDeviceId?: string | null;
   children: ReactNode;
 }
 
 function RailButton(props: RailButtonProps) {
   // Quota follows the directory's owner: remote directories read that device's mirrors
   // and must never borrow this desktop's account quota.
+  if (props.shareDeviceId) {
+    return <SharedProviderQuotaButton {...props} shareDeviceId={props.shareDeviceId} />;
+  }
   return props.provider ? (
     <ProviderQuotaButton {...props} provider={props.provider} />
   ) : (
     <RailButtonView {...props} />
   );
+}
+
+function SharedProviderQuotaButton(props: RailButtonProps & { shareDeviceId: string }) {
+  const quota = useProviderShareWeeklyQuota(props.shareDeviceId);
+  return <RailButtonView {...props} quota={quota} />;
 }
 
 function ProviderQuotaButton(props: RailButtonProps & { provider: ProviderView }) {
@@ -181,6 +243,7 @@ function ProviderQuotaButton(props: RailButtonProps & { provider: ProviderView }
 function RailButtonView({
   label,
   accountIdentity,
+  groupNote,
   isActive,
   itemKey,
   onClick,
@@ -197,16 +260,21 @@ function RailButtonView({
       ? null
       : `${t('quotaCard.weeklyLabel')} · ${t('quotaCard.remainingPercent', { percent: remaining })}`;
   const reset = formatQuotaResetCountdown(quota?.resetsAt, Date.now(), t);
-  const displayLabel = providerAccountLabel(label, accountIdentity);
-  const tooltip = quotaLabel ? (
-    <>
-      <div>{displayLabel}</div>
-      {quotaLabel && <div>{quotaLabel}</div>}
-      {reset && <div>{reset}</div>}
-    </>
-  ) : (
-    displayLabel
-  );
+  // 供应商组：组名不带某一台的账号，账号跟在「当前在 {电脑} 上运行」后面。
+  const displayLabel = groupNote ? label : providerAccountLabel(label, accountIdentity);
+  const note = groupNote ? providerAccountLabel(groupNote, accountIdentity) : null;
+  const description = [note, quotaLabel].filter(Boolean).join(' · ');
+  const tooltip =
+    quotaLabel || note ? (
+      <>
+        <div>{displayLabel}</div>
+        {note && <div>{note}</div>}
+        {quotaLabel && <div>{quotaLabel}</div>}
+        {reset && <div>{reset}</div>}
+      </>
+    ) : (
+      displayLabel
+    );
   return (
     <Tip
       text={tooltip}
@@ -219,7 +287,7 @@ function RailButtonView({
         disabled={disabled}
         onClick={onClick}
         aria-label={displayLabel}
-        aria-description={quotaLabel ?? undefined}
+        aria-description={description || undefined}
         aria-pressed={isActive}
         data-rail-item={itemKey}
         className={cn(

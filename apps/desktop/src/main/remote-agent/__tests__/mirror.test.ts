@@ -4,19 +4,25 @@
  * 映射回你这台的真实路径。
  */
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import type { AgentEvent, AgentSessionHandle } from '@cindy/maker-core';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import WebSocket from 'ws';
 
 import {
   collectAncestorInstructionFiles,
+  collectAncestorMarkers,
+  collectInstructionImports,
   collectPersonalConfig,
   collectProjectInstructionFiles,
 } from '../controller/projectFiles';
 import { shadowAliases, startRemoteAgentSession } from '../controller/startRemote';
+import { EXEC_SERVER_NOT_FOUND_CODE } from '../host/execServerShortcut';
 import { createRemoteAgentHost, mirrorSegments, type HostedStartInput } from '../host/runHost';
 import { hostedStartOptions } from '../host/service';
 import { ExecutorWorkspace } from '../executor/workspace';
@@ -69,6 +75,26 @@ describe('shadowAliases', () => {
     ]);
   });
 
+  it.each(['/runs', 'C:\\runs'])('reads inherited fork paths from %s in the original project without granting parent access', (runs) => {
+    const native = runs.startsWith('C:') ? path.win32 : path.posix;
+    const project = path.join(root, 'project');
+    write(path.join(project, 'src', 'index.ts'), 'original file');
+    const mirrorRoot = native.join(runs, 'child', 'fs');
+    const previousMirrorRoots = ['source', 'parent'].map((id) => native.join(runs, id, 'fs'));
+    const suffix = native.join('workspace', ...Array.from({ length: MAX_ANCESTOR_LEVELS }, () => 'p'));
+    const shadowDir = native.join(mirrorRoot, suffix);
+    const workspace = new ExecutorWorkspace({ workingDir: project });
+    workspace.setAliases(shadowAliases({ shadowDir, mirrorRoot, virtualWorkspace: true, previousMirrorRoots }, project, []));
+    workspace.setVirtualRoot(mirrorRoot);
+    for (const previous of previousMirrorRoots) {
+      const resolved = workspace.resolve(native.join(previous, suffix, 'src', 'index.ts'));
+      expect(workspace.contains(resolved)).toBe(true);
+      expect(fs.readFileSync(resolved, 'utf8')).toBe('original file');
+      expect(workspace.contains(workspace.resolve(native.join(previous, suffix, '..', 'outside.txt')))).toBe(false);
+    }
+    expect(workspace.resolve(workspace.toAgentPath(path.join(project, 'src', 'index.ts')))).toBe(path.join(project, 'src', 'index.ts'));
+  });
+
   it('only maps the shadow itself when the other computer did not mirror the path', () => {
     expect(shadowAliases({ shadowDir: '/runs/shadow' }, '/Users/me/proj', [])).toEqual([
       { from: '/runs/shadow', to: '/Users/me/proj' },
@@ -103,42 +129,114 @@ describe('collectAncestorInstructionFiles', () => {
   });
 });
 
+/** 目录链接：Windows 用 junction(不需要管理员权限)。 */
+function linkDir(target: string, link: string): void {
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+}
+
+/** 文件链接：没有权限创建时返回 false(没开开发者模式的 Windows)。 */
+function linkFile(target: string, link: string): boolean {
+  try {
+    fs.symlinkSync(target, link, 'file');
+    return true;
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? '')) return false;
+    throw error;
+  }
+}
+
+function decode(files: Array<{ path: string; data: string }>): Record<string, string> {
+  return Object.fromEntries(files.map((file) => [file.path, Buffer.from(file.data, 'base64').toString()]));
+}
+
 describe('collectProjectInstructionFiles', () => {
-  it('rejects directory links so a checkout cannot smuggle files from outside the project', async () => {
+  it('follows directory links the way the Agent does on this computer', async () => {
     const project = path.join(root, 'proj');
-    const outside = path.join(root, 'outside');
+    const shared = path.join(root, 'shared-skills', 'deploy');
     write(path.join(project, 'CLAUDE.md'), 'real rules');
-    write(path.join(outside, 'SKILL.md'), 'secret leak');
-    fs.mkdirSync(path.join(project, '.claude', 'skills'), { recursive: true });
-    // Windows junction 不需要文件 symlink 的管理员权限，目录越界检查仍实跑。
-    fs.symlinkSync(outside, path.join(project, '.claude', 'skills', 'leak'), process.platform === 'win32' ? 'junction' : 'dir');
-    const files = await collectProjectInstructionFiles(project);
-    expect(files.map((file) => file.path)).toEqual(['CLAUDE.md']);
-    expect(files.map((file) => Buffer.from(file.data, 'base64').toString())).toEqual(['real rules']);
+    write(path.join(shared, 'SKILL.md'), 'deploy skill');
+    write(path.join(shared, 'scripts', 'run.sh'), 'echo deploy');
+    linkDir(shared, path.join(project, '.claude', 'skills', 'deploy'));
+    expect(decode(await collectProjectInstructionFiles(project))).toEqual({
+      'CLAUDE.md': 'real rules',
+      '.claude/skills/deploy/SKILL.md': 'deploy skill',
+      '.claude/skills/deploy/scripts/run.sh': 'echo deploy',
+    });
   });
 
-  it('rejects file symlinks when the filesystem supports creating them', async (context) => {
+  it('follows file links when the filesystem supports creating them', async (context) => {
     const project = path.join(root, 'proj');
-    const outside = path.join(root, 'outside');
-    write(path.join(project, 'CLAUDE.md'), 'real rules');
-    write(path.join(outside, 'leak.md'), 'secret leak');
-    write(path.join(outside, '.env'), 'SECRET=1');
-    fs.mkdirSync(path.join(project, '.claude', 'skills'), { recursive: true });
-    // 实际探测文件 symlink 能力；有权限的 Windows 与 macOS/Linux 均保留真实覆盖。
-    try {
-      fs.symlinkSync(path.join(outside, '.env'), path.join(project, 'CLAUDE.local.md'), 'file');
-    } catch (error) {
-      if (['EPERM', 'EACCES', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-        context.skip();
-        return;
-      }
-      throw error;
+    write(path.join(project, 'AGENTS.md'), 'shared rules');
+    if (!linkFile(path.join(project, 'AGENTS.md'), path.join(project, 'CLAUDE.md'))) {
+      context.skip();
+      return;
     }
-    fs.symlinkSync(path.join(outside, 'leak.md'), path.join(project, '.claude', 'skills', 'leak.md'));
-    const files = await collectProjectInstructionFiles(project);
-    expect(files.map((file) => file.path)).toEqual(['CLAUDE.md']);
-    const decoded = files.map((file) => Buffer.from(file.data, 'base64').toString());
-    expect(decoded).toEqual(['real rules']);
+    expect(decode(await collectProjectInstructionFiles(project))).toEqual({
+      'CLAUDE.md': 'shared rules',
+      'AGENTS.md': 'shared rules',
+    });
+  });
+
+  it('stops at a link back to its own parent and keeps a folder that two links share', async () => {
+    const project = path.join(root, 'proj');
+    const skills = path.join(project, '.claude', 'skills');
+    write(path.join(skills, 'a', 'SKILL.md'), 'a');
+    linkDir(skills, path.join(skills, 'loop'));
+    write(path.join(root, 'common', 'SKILL.md'), 'common');
+    linkDir(path.join(root, 'common'), path.join(skills, 'one'));
+    linkDir(path.join(root, 'common'), path.join(skills, 'two'));
+    expect(decode(await collectProjectInstructionFiles(project))).toEqual({
+      '.claude/skills/a/SKILL.md': 'a',
+      '.claude/skills/one/SKILL.md': 'common',
+      '.claude/skills/two/SKILL.md': 'common',
+    });
+  });
+
+  it('leaves credential files for later on a shared provider, judging links by their real target', async () => {
+    const project = path.join(root, 'proj');
+    write(path.join(project, 'CLAUDE.md'), 'rules');
+    write(path.join(project, '.claude', 'skills', 'deploy', 'SKILL.md'), 'deploy');
+    write(path.join(project, '.claude', 'skills', 'deploy', '.env'), 'TOKEN=1');
+    write(path.join(project, '.claude', 'settings.json'), JSON.stringify({ permissions: { allow: ['Bash(ls)'] } }));
+    write(path.join(root, 'outside', '.aws', 'credentials'), 'aws secret');
+    linkDir(path.join(root, 'outside', '.aws'), path.join(project, '.claude', 'skills', 'cloud'));
+    const own = decode(await collectProjectInstructionFiles(project));
+    expect(own['.claude/skills/deploy/.env']).toBe('TOKEN=1');
+    expect(own['.claude/skills/cloud/credentials']).toBe('aws secret');
+    const shared = decode(await collectProjectInstructionFiles(project, { skipCredentials: true }));
+    expect(Object.keys(shared).sort()).toEqual(['.claude/settings.json', '.claude/skills/deploy/SKILL.md', 'CLAUDE.md']);
+  });
+});
+
+describe('what gets synced', () => {
+  it('includes project rules, .claude/CLAUDE.md and Codex project skills', async () => {
+    const project = path.join(root, 'proj');
+    write(path.join(project, '.claude', 'CLAUDE.md'), 'project memory');
+    write(path.join(project, '.claude', 'rules', 'style.md'), 'style rule');
+    write(path.join(project, '.claude', 'rules', 'frontend', 'react.md'), 'react rule');
+    write(path.join(project, '.codex', 'skills', 'ship', 'SKILL.md'), 'ship');
+    write(path.join(project, '.codex', 'config.toml'), 'model = "x"');
+    expect(decode(await collectProjectInstructionFiles(project))).toEqual({
+      '.claude/CLAUDE.md': 'project memory',
+      '.claude/rules/style.md': 'style rule',
+      '.claude/rules/frontend/react.md': 'react rule',
+      '.codex/skills/ship/SKILL.md': 'ship',
+    });
+  });
+
+  it('gives every Skill entry file a place before any supporting file', async () => {
+    const project = path.join(root, 'proj');
+    const big = path.join(project, '.claude', 'skills', 'big');
+    write(path.join(big, 'SKILL.md'), 'big');
+    for (let index = 0; index < 600; index += 1) write(path.join(big, 'references', `r${index}.txt`), 'x');
+    write(path.join(project, '.claude', 'skills', 'zz-small', 'SKILL.md'), 'small');
+    write(path.join(project, '.claude', 'agents', 'helper.md'), 'helper');
+    const files = decode(await collectProjectInstructionFiles(project));
+    expect(Object.keys(files)).toHaveLength(512);
+    expect(files['.claude/skills/big/SKILL.md']).toBe('big');
+    expect(files['.claude/skills/zz-small/SKILL.md']).toBe('small');
+    expect(files['.claude/agents/helper.md']).toBe('helper');
   });
 });
 
@@ -169,6 +267,67 @@ describe('collectPersonalConfig', () => {
     expect(roots).toContainEqual({ relative: '.claude/skills/mine', local: path.join(home, '.claude', 'skills', 'mine') });
   });
 
+  it('follows personal Skills that are links, and a skills folder that is itself a link', async () => {
+    const home = path.join(root, 'home');
+    const dotfiles = path.join(root, 'dotfiles');
+    write(path.join(dotfiles, 'skills', 'git', 'SKILL.md'), 'git skill');
+    write(path.join(dotfiles, 'skills', 'git', 'reference.md'), 'git reference');
+    linkDir(path.join(dotfiles, 'skills', 'git'), path.join(home, '.claude', 'skills', 'git'));
+    const linked = await collectPersonalConfig('claude-code', [], { env: {}, home });
+    expect(decode(linked.personal.files)).toEqual({
+      '.claude/skills/git/SKILL.md': 'git skill',
+      '.claude/skills/git/reference.md': 'git reference',
+    });
+    expect(linked.roots).toEqual([{ relative: '.claude/skills/git', local: path.join(home, '.claude', 'skills', 'git') }]);
+
+    const stowed = path.join(root, 'stowed');
+    write(path.join(stowed, '.claude', 'CLAUDE.md'), 'personal memory');
+    linkDir(path.join(dotfiles, 'skills'), path.join(stowed, '.claude', 'skills'));
+    const whole = await collectPersonalConfig('claude-code', [], { env: {}, home: stowed });
+    expect(whole.personal.memory).toBe('personal memory');
+    expect(Object.keys(decode(whole.personal.files)).sort()).toEqual(['.claude/skills/git/SKILL.md', '.claude/skills/git/reference.md']);
+  });
+
+  it("collects personal rules for Claude Code", async () => {
+    const home = path.join(root, 'home');
+    write(path.join(home, '.claude', 'rules', 'tone.md'), 'be brief');
+    const { personal, roots } = await collectPersonalConfig('claude-code', [
+      { path: '.claude/rules/shared.md', data: '' },
+    ], { env: {}, home });
+    expect(decode(personal.files)).toEqual({ '.claude/rules/tone.md': 'be brief' });
+    expect(roots).toEqual([{ relative: '.claude/rules/tone.md', local: path.join(home, '.claude', 'rules', 'tone.md') }]);
+  });
+
+  it('collects personal Skills for Codex and Pi where they look for Skills, leaving managed ones', async () => {
+    const home = path.join(root, 'home');
+    write(path.join(home, '.agents', 'skills', 'review', 'SKILL.md'), 'review');
+    write(path.join(home, '.agents', 'skills', 'cindy-built-in', 'SKILL.md'), 'managed');
+    write(path.join(home, '.codex', 'skills', 'deploy', 'SKILL.md'), 'deploy');
+    write(path.join(home, '.codex', 'skills', '.system', 'skill-creator', 'SKILL.md'), 'system');
+    write(path.join(home, '.codex', 'skills', 'xdt-agents', 'SKILL.md'), 'managed link');
+    const codex = await collectPersonalConfig('codex', [], { env: {}, home });
+    expect(decode(codex.personal.files)).toEqual({
+      '.agents/skills/review/SKILL.md': 'review',
+      '.codex/skills/deploy/SKILL.md': 'deploy',
+    });
+    expect(codex.roots).toEqual([
+      { relative: '.agents/skills/review', local: path.join(home, '.agents', 'skills', 'review') },
+      { relative: '.codex/skills/deploy', local: path.join(home, '.codex', 'skills', 'deploy') },
+    ]);
+    const pi = await collectPersonalConfig('pi', [
+      { path: '.agents/skills/review/SKILL.md', data: '' },
+    ], { env: {}, home });
+    expect(pi.personal.files).toEqual([]);
+  });
+
+  it('leaves credential files in personal Skills for later on a shared provider', async () => {
+    const home = path.join(root, 'home');
+    write(path.join(home, '.claude', 'skills', 'deploy', 'SKILL.md'), 'deploy');
+    write(path.join(home, '.claude', 'skills', 'deploy', '.env'), 'TOKEN=1');
+    const { personal } = await collectPersonalConfig('claude-code', [], { env: {}, home, skipCredentials: true });
+    expect(decode(personal.files)).toEqual({ '.claude/skills/deploy/SKILL.md': 'deploy' });
+  });
+
   it('honours CLAUDE_CONFIG_DIR and syncs nothing when there is no personal config', async () => {
     const configDir = path.join(root, 'custom-claude');
     write(path.join(configDir, 'CLAUDE.md'), 'from custom dir');
@@ -186,6 +345,63 @@ describe('collectPersonalConfig', () => {
     write(path.join(codexHome, 'AGENTS.override.md'), 'override');
     expect((await collectPersonalConfig('codex', [], { env: { CODEX_HOME: codexHome }, home: root })).personal.instructions)
       .toBe('override');
+  });
+});
+
+describe('collectInstructionImports', () => {
+  const b64 = (text: string) => Buffer.from(text).toString('base64');
+  const text = (data: string) => Buffer.from(data, 'base64').toString();
+
+  it('brings imported files along and rewrites imports that would not resolve on the other computer', async () => {
+    const home = path.join(root, 'home');
+    const project = path.join(home, 'code', 'proj');
+    write(path.join(project, 'docs', 'rules.md'), 'rules @more.md');
+    write(path.join(project, 'docs', 'more.md'), 'more');
+    write(path.join(project, 'docs', 'agents-extra.md'), 'extra');
+    write(path.join(project, 'ignored.md'), 'ignored');
+    write(path.join(project, 'AGENTS.md'), 'agents @docs/agents-extra.md');
+    write(path.join(home, '.claude', 'style.md'), 'style');
+    write(path.join(home, '.claude', 'RTK.md'), 'rtk');
+    write(path.join(home, '.claude', 'tools.md'), 'tools');
+    const claude = { path: 'CLAUDE.md', data: b64('See @docs/rules.md and @~/.claude/style.md.\n\`\`\`\n@ignored.md\n\`\`\`\nAlso @AGENTS.md, ask @someone') };
+    const agents = { path: 'AGENTS.md', data: b64('agents @docs/agents-extra.md') };
+    const rule = { path: '.claude/rules/team.md', data: b64('team rule @../style.md') };
+    const personal = { memory: 'memory @RTK.md and @~/.claude/tools.md', files: [rule] };
+    const files = await collectInstructionImports(
+      { workingDir: project, projectFiles: [claude, agents], ancestorFiles: [], personal },
+      { env: {}, home },
+    );
+    expect(Object.fromEntries(files.map((file) => [`${file.base}:${file.path}`, text(file.data)]))).toEqual({
+      'workspace:docs/rules.md': 'rules @more.md',
+      'workspace:docs/more.md': 'more',
+      'workspace:../../.claude/style.md': 'style',
+      'workspace:docs/agents-extra.md': 'extra',
+      'session:RTK.md': 'rtk',
+      'session:tools.md': 'tools',
+    });
+    expect(text(claude.data)).toBe('See @docs/rules.md and @../../.claude/style.md.\n\`\`\`\n@ignored.md\n\`\`\`\nAlso @AGENTS.md, ask @someone');
+    expect(text(agents.data)).toBe('agents @docs/agents-extra.md');
+    expect(text(rule.data)).toBe('team rule @../../../../.claude/style.md');
+    expect(personal.memory).toBe('memory @RTK.md and @tools.md');
+  });
+
+  it('follows imports five levels deep, like Claude Code', async () => {
+    const project = path.join(root, 'proj');
+    for (let level = 1; level <= 7; level += 1) write(path.join(project, `l${level}.md`), `@l${level + 1}.md`);
+    const files = await collectInstructionImports(
+      { workingDir: project, projectFiles: [{ path: 'CLAUDE.md', data: b64('@l1.md') }], ancestorFiles: [], personal: { files: [] } },
+      { env: {}, home: path.join(root, 'home') },
+    );
+    expect(files.map((file) => file.path)).toEqual(['l1.md', 'l2.md', 'l3.md', 'l4.md', 'l5.md']);
+  });
+
+  it('leaves imported credential files for later on a shared provider', async () => {
+    const project = path.join(root, 'proj');
+    write(path.join(project, '.env'), 'TOKEN=1');
+    write(path.join(project, 'notes.md'), 'notes');
+    const input = { workingDir: project, projectFiles: [{ path: 'CLAUDE.md', data: b64('@.env @notes.md') }], ancestorFiles: [], personal: { files: [] } };
+    expect((await collectInstructionImports(input, { env: {}, home: root, skipCredentials: true })).map((file) => file.path))
+      .toEqual(['notes.md']);
   });
 });
 
@@ -298,5 +514,137 @@ describe('shadow on the other computer', () => {
 
     await handle.close({ reason: 'navigation' });
     host.dispose();
+  });
+
+  // 2026-10-22 远程供应商调查：Codex 沿虚拟工作区逐级查找，虚拟垫层与任务电脑已报「没有」的标记可以本机回答。
+  // 镜像外的隐藏文件可能在任务电脑同一路径真实存在(#6844 review)，没有确认不存在的一律照常转发。
+  it('answers lookups the task computer cannot map on this computer and forwards the rest', async () => {
+    const project = path.join(root, 'work', 'proj');
+    const external = path.join(root, 'external');
+    fs.mkdirSync(external);
+    write(path.join(project, 'hello.txt'), 'hi');
+    write(path.join(root, 'work', '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    write(path.join(root, '.bashrc'), 'export TASK_SHELL_CONFIG=1\n');
+    const inputs: HostedStartInput[] = [];
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => { stop = resolve; });
+    const host = createRemoteAgentHost({
+      isAgentAvailable: () => true,
+      startHosted: async (input) => {
+        inputs.push(input);
+        // 事件流一直开着，任务(和它的隧道)活到测试结束。
+        return {
+          ...idleHandle(input),
+          async close() { stop(); },
+          events: () => ({
+            [Symbol.asyncIterator]: (): AsyncIterator<AgentEvent> => ({
+              next: async () => {
+                await stopped;
+                return { done: true, value: undefined };
+              },
+            }),
+          }),
+        };
+      },
+      isControllerAuthorized: () => true,
+      captureOwner: () => 'owner',
+      isOwnerCurrent: () => true,
+      runsRoot: path.join(root, 'host'),
+    });
+    const forwarded = new Set<number>();
+    const handle = await startRemoteAgentSession('claude-code', {
+      sessionId: 'task-lookups',
+      workingDir: project,
+      extraDirs: [external],
+      model: 'claude-opus',
+      permissionMode: 'default',
+    }, {
+      invoke: async (args) => {
+        const request = JSON.parse(JSON.stringify(args[0])) as { op: string };
+        // 本测试只看哪些消息到了任务所在电脑：不让控制端关掉这条连接(Claude Code 的控制端没有 exec-server 中继)。
+        if (request.op === 'push') return {};
+        const result = JSON.parse(JSON.stringify(await host.handle('controller-1', request) ?? null)) as { runs?: Array<{ data?: string }> } | null;
+        for (const run of request.op === 'poll' ? result?.runs ?? [] : []) {
+          for (const line of Buffer.from(run.data ?? '', 'base64').toString('utf8').split('\n').filter(Boolean)) {
+            const item = JSON.parse(line) as { t?: string; kind?: string; data?: string };
+            if (item.t === 'ws' && item.kind === 'message' && item.data) forwarded.add((JSON.parse(item.data) as { id: number }).id);
+          }
+        }
+        return result;
+      },
+      rgPath: RG,
+      prepareMcp: async () => ({ servers: new Map(), dispose() {} }),
+      collectProjectFiles: async () => [],
+      collectAncestorMarkers,
+      isGitRepo: async () => false,
+      newId: randomUUID,
+    });
+    const [input] = inputs;
+    // 任务所在电脑上的映射(控制端实际使用的那一份)：有对应目录的最上一级是项目的真实根目录。
+    const mapped = new ExecutorWorkspace({ workingDir: project, aliases: shadowAliases(
+      { ...input, virtualWorkspace: true }, project, [], { extraDirs: [external], writableDirs: [] },
+    ) });
+    let top = input.shadowDir;
+    while (mapped.localPathFromAgent(path.dirname(top)) !== null && path.dirname(top) !== top) top = path.dirname(top);
+    const padded = path.dirname(top);
+    expect(padded.startsWith(path.join(input.mirrorRoot, 'workspace'))).toBe(true);
+    const parent = path.dirname(input.shadowDir);
+    const grandparent = path.dirname(parent);
+    // Windows 的生产路径映射不区分大小写；原矩阵只有小写，遗漏了会把已存在目录误报 -32004 的输入。
+    // 同一 standard fixture 经真实 Host/隧道验证 HOME、TMP、ADDITIONAL，并确认原执行器能解析到现有目录。
+    const mappedCaseVariants = process.platform === 'win32' ? [
+      path.join(input.mirrorRoot, 'HOME'),
+      path.join(input.mirrorRoot, 'TMP'),
+      path.join(input.mirrorRoot, 'ADDITIONAL', 'dir-0'),
+    ] : [];
+    for (const target of mappedCaseVariants) expect(fs.existsSync(mapped.resolve(target))).toBe(true);
+    const cases = [
+      ...mappedCaseVariants.map((target) => ({ target, local: false })),
+      { target: path.join(input.shadowDir, 'hello.txt'), local: false },
+      { target: path.join(input.shadowDir, '.git'), local: false },
+      { target: path.join(parent, '.git'), local: false },
+      { target: path.join(parent, '.git', 'HEAD'), local: false },
+      { target: path.join(top, 'not-a-marker'), local: false },
+      { target: path.join(input.mirrorRoot, 'home', '.agents', 'skills'), local: false },
+      { target: path.join(path.parse(input.mirrorRoot).root, 'not-a-cindy-dir', 'tool'), local: false },
+      // 镜像外的绝对路径会原样交给任务电脑；同一路径下的隐藏文件/已存在标记不能凭点前缀判不存在。
+      { target: path.join(root, '.bashrc'), local: false },
+      { target: path.join(root, 'work', '.git', 'HEAD'), local: false },
+      { target: path.join(root, 'work', '.codex-plugin', 'plugin.json'), local: true },
+      { target: path.join(grandparent, '.git'), local: true },
+      { target: path.join(grandparent, '.cursor-plugin', 'plugin.json'), local: true },
+      { target: path.join(padded, '.git'), local: true },
+      { target: path.join(padded, '.codex-plugin', 'plugin.json'), local: true },
+      { target: path.join(input.mirrorRoot, 'workspace', '.agents', 'skills'), local: true },
+      { target: path.join(path.dirname(path.dirname(input.mirrorRoot)), '.claude-plugin', 'plugin.json'), local: false },
+    ];
+    const ws = new WebSocket(`${input.tunnel.url.replace(/^http/, 'ws')}/ws/exec-server`, { headers: { authorization: `Bearer ${input.tunnel.token}` } });
+    const replies = new Map<number, { error?: { code?: number } }>();
+    ws.on('message', (data) => {
+      const message = JSON.parse(String(data)) as { id: number; error?: { code?: number } };
+      replies.set(message.id, message);
+    });
+    await once(ws, 'open');
+    try {
+      cases.forEach(({ target }, index) => ws.send(JSON.stringify({ id: index + 1, method: 'fs/getMetadata', params: { path: pathToFileURL(target).href } })));
+      const localIds = cases.flatMap(({ local }, index) => local ? [index + 1] : []);
+      const forwardedIds = cases.flatMap(({ local }, index) => local ? [] : [index + 1]);
+      await vi.waitFor(() => {
+        expect([...replies.keys()].sort((a, b) => a - b)).toEqual(localIds);
+        expect([...forwarded].sort((a, b) => a - b)).toEqual(forwardedIds);
+      });
+      for (const id of localIds) expect(replies.get(id)?.error?.code).toBe(EXEC_SERVER_NOT_FOUND_CODE);
+      // 映射不到的绝对路径会原样转发；本机回答的所有目标在任务电脑上都确实不存在。
+      for (const { target } of cases.filter(({ local }) => local)) {
+        const real = mapped.localPathFromAgent(target) ?? target;
+        expect(fs.existsSync(real)).toBe(false);
+      }
+      expect(fs.existsSync(mapped.localPathFromAgent(path.join(parent, '.git', 'HEAD'))!)).toBe(true);
+      expect(fs.readFileSync(path.join(root, '.bashrc'), 'utf8')).toContain('TASK_SHELL_CONFIG');
+    } finally {
+      ws.close();
+      await handle.close({ reason: 'navigation' });
+      host.dispose();
+    }
   });
 });

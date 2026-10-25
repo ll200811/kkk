@@ -7,6 +7,7 @@ import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ipcMain } from 'electron';
+import { WORKTREE_MOVE_BLOCKED_MESSAGE, sessionMoveFailureFeedback } from '../../../shared/worktreeMoveGuardError';
 import {
   parseAttachmentOssRef,
   TASK_MIGRATION_ESTIMATE_TIMEOUT_MS,
@@ -536,6 +537,24 @@ describe('resumable cross-computer copy', () => {
         workingDir: '/another',
       }),
     ).rejects.toThrow('MIGRATION_PROJECT_PRECONDITION_FAILED');
+    expect(state.rows.get('A')!.get('fork')!.workingDir).toBe(path.join(state.root, 'shared'));
+  });
+  it.each([null, 'B'])('preserves local worktree feedback without changing wire errors (%s)', async (device) => {
+    vi.mocked(moveSessionProjectFromHost).mockResolvedValueOnce({
+      ok: false,
+      errorCode: 'PRECONDITION_FAILED',
+      message: `[PRECONDITION_FAILED] ${WORKTREE_MOVE_BLOCKED_MESSAGE}`,
+    });
+    const error = await localHandler()({} as never, device, {
+      action: 'move-project', sessionId: 'fork', workingDir: '/another',
+    }).catch((error: unknown) => error);
+    if (device === null) {
+      expect(sessionMoveFailureFeedback('project', error)).toEqual({
+        level: 'warning', key: 'ccAgent.sidebar.sessionMenu.moveToProjectWorktreeBlocked',
+      });
+    } else {
+      expect(error).toEqual(expect.objectContaining({ message: expect.stringContaining('MIGRATION_PROJECT_PRECONDITION_FAILED') }));
+    }
     expect(state.rows.get('A')!.get('fork')!.workingDir).toBe(path.join(state.root, 'shared'));
   });
   it('rejects a local move when its captured owner changes before the host writes', async () => {

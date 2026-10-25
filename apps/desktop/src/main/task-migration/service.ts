@@ -46,6 +46,7 @@ import {
 import { createLogger } from '../logger';
 import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer';
 import { throwIpcError } from '../utils/ipcValidate';
+import { isWorktreeMoveBlockedError, WORKTREE_MOVE_BLOCKED_MESSAGE } from '../../shared/worktreeMoveGuardError';
 import { atomicWriteFileSync, readAtomicFileSync } from '../utils/atomicWriteFile';
 import { captureMediaRefCompensationScope } from '../cindy-media/refCompensationJournal';
 import { exportSessionShare } from '../session-share/sessionShareExport';
@@ -1298,6 +1299,7 @@ async function activate(scope: Scope, record: IncomingMigration) {
 async function moveProjectWithinScope(
   scope: Scope,
   request: TaskProjectMoveRequest,
+  preserveLocalWorktreeFeedback = false,
 ): Promise<LocalTaskProjectMoveReceipt> {
   if (!moveProjectOnHost) throw new Error('MIGRATION_HOST_NOT_READY');
   const result = await moveProjectOnHost(
@@ -1306,7 +1308,13 @@ async function moveProjectWithinScope(
     scope.assertCurrent,
   );
   scope.assertCurrent();
-  if (!result.ok) throw new Error(`MIGRATION_PROJECT_${result.errorCode}`);
+  if (!result.ok) {
+    // Keep the existing local UI warning without changing the device wire error contract.
+    const error = Object.assign(new Error(result.message), { code: result.errorCode });
+    if (preserveLocalWorktreeFeedback && isWorktreeMoveBlockedError(error))
+      throwIpcError('PRECONDITION_FAILED', WORKTREE_MOVE_BLOCKED_MESSAGE);
+    throw new Error(`MIGRATION_PROJECT_${result.errorCode}`);
+  }
   return {
     supported: true,
     projectMove: {
@@ -1509,7 +1517,7 @@ export function registerTaskMigrationIpc(
       // Local regrouping must work before Device Link has ever connected. Only this
       // trusted IPC branch may omit deviceId; remote replies still use the wire view.
       if (device == null && request.action === 'move-project')
-        return await moveProjectWithinScope(captureScope(), request);
+        return await moveProjectWithinScope(captureScope(), request, true);
       if (device == null || device === getSelfDeviceId())
         return await requestTaskMigration(request);
       if (
@@ -1520,6 +1528,8 @@ export function registerTaskMigrationIpc(
         throw new Error('MIGRATION_TARGET_INVALID');
       return await invoke(device, request, captureScope());
     } catch (error) {
+      if (device == null && request.action === 'move-project' && isWorktreeMoveBlockedError(error))
+        throw error;
       throwIpcError('PRECONDITION_FAILED', errorCode(error));
     }
   });
