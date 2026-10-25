@@ -145,17 +145,39 @@ function removeIfDead(filePath: string): boolean {
   }
 }
 
-function writeOwnerExclusive(filePath: string, owner: LeaseOwner): boolean {
+function writeOwnerExclusive(
+  filePath: string,
+  owner: LeaseOwner,
+  candidateDir = path.dirname(filePath),
+): boolean {
+  const candidate = path.join(candidateDir, '.schema-lease-candidate-' + crypto.randomUUID());
+  let fd: number | null = null;
+  let candidateCreated = false;
   try {
-    fs.writeFileSync(filePath, `${JSON.stringify(owner)}\n`, {
-      encoding: 'utf8',
-      flag: 'wx',
-      mode: 0o600,
-    });
+    // Publish only a complete record. A failed/interrupted write must not leave
+    // an empty canonical lock that readOwner cannot attribute or reclaim.
+    fd = fs.openSync(candidate, 'wx', 0o600);
+    candidateCreated = true;
+    fs.writeFileSync(fd, JSON.stringify(owner) + '\n', 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    try {
+      // Unlike rename, a hard link never replaces a competing lease. Keeping
+      // the record format and canonical path also preserves older readers.
+      fs.linkSync(candidate, filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      throw error;
+    }
     return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    throw err;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* Keep the original publication error. */ }
+    }
+    if (candidateCreated) {
+      try { fs.unlinkSync(candidate); } catch { /* Never release a published lease. */ }
+    }
   }
 }
 
@@ -204,7 +226,9 @@ export function acquireSchemaMigrationReaderLease(
   fs.mkdirSync(paths.readers, { recursive: true, mode: 0o700 });
   const owner = createOwner();
   const readerPath = path.join(paths.readers, `${owner.pid}-${owner.token}.json`);
-  if (!writeOwnerExclusive(readerPath, owner)) {
+  // Interrupted candidates stay outside the readers directory: old versions
+  // scan every entry there and would mistake an orphan candidate for a reader.
+  if (!writeOwnerExclusive(readerPath, owner, path.dirname(paths.readers))) {
     return { acquired: false, reason: 'writer-active' };
   }
 
