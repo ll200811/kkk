@@ -5,6 +5,11 @@ vi.mock('../cindy-media/toolProcessMedia.js', () => ({ materializeToolProcessMed
 vi.mock('../localDb/client/current.js', () => ({ getDbClient: vi.fn(() => ({ drizzle: {} })) }));
 vi.mock('../botTaskReplyResults.js', () => ({ readTaskResultsForReply: vi.fn(async () => []) }));
 import { readTaskResultsForReply } from '../botTaskReplyResults.js';
+vi.mock('../readTurnResourcesForReply.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../readTurnResourcesForReply.js')>(),
+  readTurnResourcesForReply: vi.fn(async () => []),
+}));
+import { createTurnResourceReceipt, readExecutedPluginIdentity, readTurnResourcesForReply } from '../readTurnResourcesForReply.js';
 /**
  * messagePersistBroadcaster.test.ts
  * ---------------------------------------------------------------------------
@@ -4348,6 +4353,90 @@ it('persists bound results with the final seal, and a failed result lookup canno
   vi.mocked(readTaskResultsForReply).mockRejectedValueOnce(new Error('DB unavailable'));
   await expect(markAssistantTurnCompleted(SESSION, 'other', undefined, ['bot-delegation-completion:job'])).resolves.toBe(true);
   expect(patchMessageAgentMetaWithResult).toHaveBeenCalledWith(SESSION, 'other', { turnCompleted: true });
+});
+
+// Unit: the history window must not own receipts; the seal waits behind native tool
+// writes and retains the accepted input snapshot when the next input is already active.
+it('seals frozen turn resources after prior tool writes and tolerates unavailable resource history', async () => {
+  const resources = [createTurnResourceReceipt('skill', 'claude:review', 'review')!];
+  vi.mocked(readTurnResourcesForReply).mockResolvedValueOnce(resources);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const blocking = enqueueDurableWrite('resource-write-order', () => gate);
+  onToolUseEvent(SESSION, { toolUseId: 'resource-tool', toolName: 'Skill', input: { skill: 'review' } }, { replyToClientId: 'accepted' });
+  const inputs = ['accepted', 'steer'];
+  const sealed = markAssistantTurnCompleted(SESSION, 'final-resources', undefined, undefined, inputs);
+  inputs.splice(0, inputs.length, 'next-input');
+  expect(readTurnResourcesForReply).not.toHaveBeenCalled();
+  release();
+  await blocking;
+  await sealed;
+  expect(readTurnResourcesForReply).toHaveBeenCalledWith(SESSION, 'final-resources', ['accepted', 'steer']);
+  expect(createMessage).toHaveBeenCalledWith(SESSION, expect.objectContaining({ role: 'tool_use' }), expect.anything());
+  expect(vi.mocked(createMessage).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(readTurnResourcesForReply).mock.invocationCallOrder[0]);
+  expect(patchMessageAgentMetaWithResult).toHaveBeenCalledWith(SESSION, 'final-resources', { turnCompleted: true, turnResources: resources });
+  expect(broadcastMessageAgentMetaUpdate).toHaveBeenCalledWith(SESSION, 'final-resources', expect.anything());
+  vi.mocked(readTurnResourcesForReply).mockRejectedValueOnce(new Error('History unavailable'));
+  await expect(markAssistantTurnCompleted(SESSION, 'fallback-final', undefined, undefined, ['accepted'])).resolves.toBe(true);
+  expect(patchMessageAgentMetaWithResult).toHaveBeenCalledWith(SESSION, 'fallback-final', { turnCompleted: true });
+});
+
+it('records only a native named Workflow start and drops an in-flight record after clear', async () => {
+  vi.mocked(findVisibleToolUseMessageByAliases).mockResolvedValue({ clientId: 'workflow-tool-row', toolUseId: 'workflow-native-id' });
+  const update = { provider: 'claude-code', taskId: 'workflow-task', parentToolUseId: 'workflow-native-id',
+    taskType: 'local_workflow', status: 'running', workflowName: 'Release pipeline' };
+  expect(onAgentTaskUpdateEvent(SESSION, update)).toBe(true);
+  await drainPersistQueue();
+  expect(patchMessageAgentMetaWithResult).toHaveBeenCalledWith(SESSION, 'workflow-tool-row', {
+    workflowResource: createTurnResourceReceipt('workflow', 'Release pipeline', 'Release pipeline'),
+  });
+  vi.mocked(patchMessageAgentMetaWithResult).mockClear();
+  expect(onAgentTaskUpdateEvent(SESSION, { ...update, workflowName: undefined })).toBe(false);
+  expect(onAgentTaskUpdateEvent(SESSION, { ...update, workflowName: 'hidden\nlabel' })).toBe(false);
+  expect(onAgentTaskUpdateEvent(SESSION, update)).toBe(true);
+  clearSessionPersistState(SESSION);
+  await drainPersistQueue();
+  expect(patchMessageAgentMetaWithResult).not.toHaveBeenCalled();
+});
+
+// Unit: all existing result assembly orders must preserve execution before the
+// display-only 8KB cap, without accepting provider-supplied resource metadata.
+it.each(['summary', 'full', 'buffered', 'update'] as const)('keeps a host plugin execution fact before capping its %s result', async order => {
+  const toolName = 'mcp__cindy__ghost_call';
+  const input = { ghost_id: 'github', namespace: 'team', tool: 'search' };
+  const fullText = JSON.stringify({ ok: true, result: { text: 'x'.repeat(10000) } });
+  const identity = readExecutedPluginIdentity(toolName, input, fullText)!;
+  vi.mocked(findVisibleToolUseMessageByAliases).mockResolvedValue({ clientId: 'plugin-row', toolUseId: 'large-plugin' });
+  if (order === 'buffered') onToolResultFullEvent(SESSION, { toolUseId: 'large-plugin', fullText }, null);
+  const providerMeta = { replyToClientId: 'accepted', turnResourcePluginExecutionId: 'provider-forgery' };
+  onToolUseEvent(SESSION, { toolUseId: 'large-plugin', toolName, input }, providerMeta);
+  if (order === 'update') onToolResultEvent(SESSION, { toolUseIds: ['large-plugin'], summary: 'pending' }, null);
+  if (order === 'summary' || order === 'buffered') {
+    onToolResultEvent(SESSION, { toolUseIds: ['large-plugin'], summary: order === 'buffered' ? '' : fullText }, null);
+  } else onToolResultFullEvent(SESSION, { toolUseId: 'large-plugin', fullText }, null);
+  await drainPersistQueue();
+  const toolUse = vi.mocked(createMessage).mock.calls.find(([, body]) => body.role === 'tool_use')?.[1];
+  expect(toolUse?.agentMeta).not.toHaveProperty('turnResourcePluginExecutionId');
+  expect(patchMessageAgentMetaWithResult).toHaveBeenCalledWith(SESSION, 'plugin-row', { turnResourcePluginExecutionId: identity });
+  const storedResult = order === 'update'
+    ? vi.mocked(updateMessageContent).mock.calls.find(([, , content]) => typeof content === 'string' && content.includes('truncated'))?.[2]
+    : vi.mocked(createMessage).mock.calls.find(([, body]) => body.role === 'tool_result')?.[1].content;
+  expect(typeof storedResult).toBe('string');
+  expect((storedResult as string).length).toBeLessThanOrEqual(8192);
+  expect(storedResult).toContain('[tool result truncated: stored first 8KB]');
+});
+
+it('does not stamp plugin execution from discovery, rejected calls or a forged provider fact', async () => {
+  const input = { ghost_id: 'github', tool: 'search' };
+  const providerMeta = { replyToClientId: 'accepted', turnResourcePluginExecutionId: 'provider-forgery' };
+  onToolUseEvent(SESSION, { toolUseId: 'discovery', toolName: 'mcp:cindy:ghost_call', input: { ...input, tool: 'list_tools' } }, providerMeta);
+  onToolResultFullEvent(SESSION, { toolUseId: 'discovery', fullText: '{"ok":true}' }, null);
+  onToolUseEvent(SESSION, { toolUseId: 'rejected', toolName: 'mcp:cindy:ghost_call', input }, providerMeta);
+  onToolResultFullEvent(SESSION, { toolUseId: 'rejected', fullText: '{"ok":false}' }, null);
+  await drainPersistQueue();
+  expect(patchMessageAgentMetaWithResult).not.toHaveBeenCalled();
+  for (const [, body] of vi.mocked(createMessage).mock.calls.filter(([, body]) => body.role === 'tool_use'))
+    expect(body.agentMeta).not.toHaveProperty('turnResourcePluginExecutionId');
 });
 
 // Unit regression: a late import updates the original result, never the next turn.

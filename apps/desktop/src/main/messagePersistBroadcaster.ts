@@ -1,6 +1,7 @@
 import { materializeToolProcessMedia } from './cindy-media/toolProcessMedia.js';
 import { withToolProcessMedia, type ProcessMediaRef, type NativeToolMedia } from '@cindy/maker-shared/tool-process-media';
 import { readTaskResultsForReply } from './botTaskReplyResults.js';
+import { createTurnResourceReceipt, readExecutedPluginIdentity, readTurnResourcesForReply } from './readTurnResourcesForReply.js';
 /**
  * messagePersistBroadcaster — 把 agent 消息的持久化从 renderer 收口到 main 单点。
  * ---------------------------------------------------------------------------
@@ -607,6 +608,7 @@ function markAssistantTurnBoundary(
   completed: boolean,
   metaPatch?: Pick<AgentMeta, 'nativeForkAnchor'>,
   taskResultInputIds?: readonly string[],
+  turnResourceInputIds?: readonly string[],
 ): Promise<boolean> {
   if (!sessionId || !clientId) return Promise.resolve(false);
   return enqueueDurableWrite(`turn-boundary:${sessionId}:${clientId}:${completed}`, async (ownerScope) => {
@@ -615,9 +617,16 @@ function markAssistantTurnBoundary(
         log.warn('Could not attach teammate results; standalone receipts remain available');
         return [];
       }) : [];
+    const turnResources = completed && turnResourceInputIds?.length
+      ? await readTurnResourcesForReply(sessionId, clientId, turnResourceInputIds).catch(() => {
+        log.warn('Could not attach turn resources; original tool history remains available');
+        return undefined;
+      }) : undefined;
+    if (!isOwnerScopeCurrent(ownerScope)) return false;
     const patched = await patchMessageAgentMetaWithResult(sessionId, clientId, {
       ...metaPatch,
       ...(botTaskResults.length ? { botTaskResults } : {}),
+      ...(turnResources !== undefined ? { turnResources } : {}),
       turnCompleted: completed,
     });
     if (!patched) return false;
@@ -635,8 +644,11 @@ export function markAssistantTurnCompleted(
   clientId: string | undefined,
   metaPatch?: Pick<AgentMeta, 'nativeForkAnchor'>,
   taskResultInputIds?: readonly string[],
+  turnResourceInputIds?: readonly string[],
 ): Promise<boolean> {
-  return markAssistantTurnBoundary(sessionId, clientId, true, metaPatch, taskResultInputIds);
+  // Freeze the accepted input set before an asynchronous FIFO write can see the next turn.
+  return markAssistantTurnBoundary(sessionId, clientId, true, metaPatch, taskResultInputIds,
+    turnResourceInputIds ? [...turnResourceInputIds] : undefined);
 }
 
 /**
@@ -998,6 +1010,12 @@ function agentTaskMetaForToolUse(
   toolName: string,
   agentMeta: AgentMeta | null,
 ): AgentMeta | null {
+  // Provider metadata cannot mint the host-only plugin execution fact.
+  if (agentMeta && 'turnResourcePluginExecutionId' in agentMeta) {
+    const sanitized = { ...agentMeta } as AgentMeta & { turnResourcePluginExecutionId?: unknown };
+    delete sanitized.turnResourcePluginExecutionId;
+    agentMeta = sanitized;
+  }
   if (!toolUseId || !isAgentTaskToolName(toolName)) return agentMeta;
   const pendingStatus = pendingAgentTaskStatusBySession.get(sessionId)?.get(toolUseId);
   if (!pendingStatus) return agentMeta;
@@ -1018,6 +1036,21 @@ function rememberAgentTaskToolUse(
 /** Persist an exact terminal lifecycle fact for history replay. */
 export function onAgentTaskUpdateEvent(sessionId: string, data: unknown): boolean {
   const update = normalizeAgentTaskUpdate(data);
+  if (update?.taskType === 'local_workflow' && update.status === 'running'
+    && update.parentToolUseId && update.workflowName) {
+    const receipt = createTurnResourceReceipt('workflow', update.workflowName, update.workflowName);
+    if (!receipt) return false;
+    const parentToolUseId = update.parentToolUseId;
+    const persistScope = captureAgentTaskPersistScope(sessionId);
+    enqueueWrite(`workflow_resource:${sessionId}:${parentToolUseId}`, async ownerScope => {
+      if (agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
+      const row = await findVisibleToolUseMessageByAliases(sessionId, [parentToolUseId]);
+      if (!row || agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
+      if (await patchMessageAgentMetaWithResult(sessionId, row.clientId, { workflowResource: receipt }))
+        await broadcastMessageAgentMetaUpdate(sessionId, row.clientId, ownerScope);
+    });
+    return true;
+  }
   if (
     !update
     || update.taskType === 'local_bash'
@@ -1670,6 +1703,23 @@ function toolResultMeta(sessionId: string, agentMeta: AgentMeta | null): AgentMe
   return agentMeta ?? lastAgentMetaBySession.get(sessionId) ?? null;
 }
 
+/** A capped tool_result is display text, not execution evidence. Keep the host fact separately. */
+function rememberExecutedPlugin(sessionId: string, toolUseIds: readonly string[], fullText: string): void {
+  for (const toolUseId of toolUseIds) {
+    const info = toolUseInfoBySession.get(sessionId)?.get(toolUseId);
+    if (!info) continue;
+    const identity = readExecutedPluginIdentity(info.toolName, info.input, fullText);
+    if (!identity) continue;
+    const persistScope = captureAgentTaskPersistScope(sessionId);
+    enqueueWrite(`plugin_execution:${sessionId}:${toolUseId}`, async () => {
+      if (agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
+      const row = await findVisibleToolUseMessageByAliases(sessionId, [toolUseId]);
+      if (!row || agentTaskPersistScopeBySession.get(sessionId) !== persistScope) return;
+      await patchMessageAgentMetaWithResult(sessionId, row.clientId, { turnResourcePluginExecutionId: identity });
+    });
+  }
+}
+
 /**
  * tool_result 的落库正文:超限截到 8KB(toolResultPersistCap)。渲染端在途气泡
  * 与本函数的返回值(resolvedContent)继续用全文,只有 DB 行有界——重开任务时
@@ -1747,6 +1797,7 @@ export function onToolResultEvent(
   if (usedBufferedContent) {
     createdAt = clampAfterLatestToolUse(sessionId, ids, createdAt, createdAtMap);
   }
+  if (scope === 'turn') rememberExecutedPlugin(sessionId, ids, content);
   const primaryToolUseId = ids[0];
 
   // 已有映射(多 toolUseId 归并到同一条)?
@@ -1874,6 +1925,7 @@ export function onToolResultFullEvent(
     releaseBackgroundStateForToolUses(sessionId, backgroundState, [toolUseId]);
     return null;
   }
+  if (scope === 'turn') rememberExecutedPlugin(sessionId, [toolUseId], fullText);
   const idMap = backgroundState?.toolResultIdByToolUseId ??
     getOrCreateSessionMap(toolResultIdByToolUseId, sessionId);
   const pending = backgroundState?.pendingFullTextByToolUseId ??
@@ -2080,6 +2132,7 @@ export function flushOrphanToolResults(sessionId: string, agentMeta: AgentMeta |
   const contentMap = getOrCreateSessionMap(toolResultContentByClientId, sessionId);
   const meta = toolResultMeta(sessionId, agentMeta);
   const persistOrphan = (toolUseId: string, text: string, createdAt: number): void => {
+    rememberExecutedPlugin(sessionId, [toolUseId], text);
     const persistId = createId();
     idMap.set(toolUseId, persistId);
     contentMap.set(persistId, text);
