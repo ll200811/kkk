@@ -11,7 +11,7 @@ export interface GroupToolAuthority {
   mode: 'owner' | 'chat' | 'tools';
   validate(): Promise<void>;
   isCurrent(): boolean;
-  currentGroup?(request: CurrentGroupRequest, confirm: (summary: Record<string, unknown>) => Promise<boolean>, assertPermission?: () => void): Promise<CurrentGroupResult>;
+  currentGroup?(request: CurrentGroupRequest, assertPermission?: () => void): Promise<CurrentGroupResult>;
 }
 const authorities = new Map<string, GroupToolAuthority>();
 
@@ -21,13 +21,13 @@ export function assertGroupToolAuthorityCurrent(sessionId: string, authority: Gr
 }
 
 /** The bound live execution supplies identity. A persisted lane or model argument never does. */
-export async function executeCurrentGroupTool(sessionId: string, request: CurrentGroupRequest, confirm: (summary: Record<string, unknown>) => Promise<boolean>, assertPermission: () => void = () => {}): Promise<CurrentGroupResult> {
+export async function executeCurrentGroupTool(sessionId: string, request: CurrentGroupRequest, assertPermission: () => void = () => {}): Promise<CurrentGroupResult> {
   const authority = authorities.get(sessionId);
   if (!authority?.currentGroup) return { ok: false, errorCode: 'NO_GROUP_EXECUTION', message: 'This tool requires an active authorized group execution.' };
   try {
     const grant = await authorizeGroupTool(sessionId, authority.botId, 'read-self');
     grant.assertCurrent();
-    return await authority.currentGroup(request, confirm, assertPermission);
+    return await authority.currentGroup(request, assertPermission);
   } catch (error) {
     return { ok: false, errorCode: error instanceof GroupToolAuthorizationError ? error.code : 'GROUP_AUTHORIZATION_UNAVAILABLE', message: 'Current group authorization could not be verified.' };
   }

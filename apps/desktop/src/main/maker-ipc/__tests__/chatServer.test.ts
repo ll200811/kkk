@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { executeArchivedGroupTool } from '../archivedGroupRecovery.js';
 const avatarUpload = vi.hoisted(() => vi.fn());
 vi.mock('../../ossPublicUpload.js', () => ({ uploadPublicAsset: avatarUpload }));
-const fixture = vi.hoisted(() => ({ upload: vi.fn(async (): Promise<unknown[]> => []), download: vi.fn(), packaged: true, urls: [] as string[], wsUrls: [] as string[], exists: vi.fn(), config: '', handle: vi.fn(), profiles: [] as unknown[], sockets: [] as import('ws').WebSocket[], token: 'isolated-test-token', refresh: vi.fn(async () => true), requests: [] as Array<{ url: string; token: string; actor?: string }> }));
+const fixture = vi.hoisted(() => ({ upload: vi.fn<(...args: Parameters<ReturnType<typeof import('../chatServerMedia.js').createChatMedia>['upload']>) => Promise<unknown[]>>(async () => []), download: vi.fn(), packaged: true, urls: [] as string[], wsUrls: [] as string[], exists: vi.fn(), config: '', handle: vi.fn(), profiles: [] as unknown[], sockets: [] as import('ws').WebSocket[], token: 'isolated-test-token', refresh: vi.fn(async () => true), requests: [] as Array<{ url: string; token: string; actor?: string }> }));
 vi.mock('../../authManager.js', () => ({ getAccessToken: () => fixture.token, refresh: fixture.refresh }));
 vi.mock('../../clientEndpointsService.js', () => ({ getClientEndpoint: () => 'https://chat.cindy.app' }));
+const replyFiles = vi.hoisted(() => ({ prepare: vi.fn(async (text: string) => ({ text, attachments: [] as unknown[] })) }));
+vi.mock('../chatServerReplyFiles.js', () => ({ prepareChatReplyFiles: replyFiles.prepare }));
 vi.mock('../chatServerMedia.js', () => ({ createChatMedia: () => ({ upload: fixture.upload, download: fixture.download }) }));
-const replyImages = vi.hoisted(() => vi.fn(async (text: string): Promise<{ text: string; attachments: import('../../../shared/botGroupChat.js').BotGroupAttachment[] }> => ({ text, attachments: [] })));
+const replyImages = vi.hoisted(() => vi.fn(async (text: string): Promise<{ text: string; attachments: import('../chatServerMedia.js').ChatUploadAttachment[] }> => ({ text, attachments: [] })));
 vi.mock('../chatServerReplyImages.js', () => ({ prepareChatReplyImages: replyImages }));
 // Persists across adapter recreation; the SQLite implementation has its own persistence tests.
 const taskPosts = vi.hoisted(() => new Map<string, unknown>());
@@ -15,7 +17,13 @@ vi.mock('../botGroupTaskPostSnapshot.js', () => ({ prepareBotGroupTaskPost: asyn
   if (!taskPosts.has(key)) taskPosts.set(key, JSON.parse(JSON.stringify(await prepare())));
   return JSON.parse(JSON.stringify(taskPosts.get(key)));
 } }));
-vi.mock('../chatServerWorkspaces.js', () => ({ chatServerWorkspaces: () => ({ read: () => null, save: vi.fn() }) }));
+// This computer's group settings; each test starts with none.
+const workspaceSettings = vi.hoisted(() => new Map<string, unknown>());
+vi.mock('../chatServerWorkspaces.js', () => ({ chatServerWorkspaces: () => ({
+  read: (room: string) => workspaceSettings.get(room) ?? null,
+  save: (room: string, value: unknown) => { workspaceSettings.set(room, value); },
+}) }));
+beforeEach(() => workspaceSettings.clear());
 const migration = vi.hoisted(() => ({ read: vi.fn<(_groupId: string) => { roomId: string; sequence: number; version: 2 } | null>(() => null) }));
 vi.mock('../chatMigrationReceipts.js', () => ({ chatMigrationReceipts: () => ({ read: migration.read, save: vi.fn() }) }));
 vi.mock('electron', () => ({ app: { get isPackaged() { return fixture.packaged; }, getPath: () => '/isolated' },
@@ -156,6 +164,7 @@ describe('Chat Server result delivery and refresh', () => {
     taskPosts.clear();
     fixture.upload.mockReset().mockResolvedValue([]);
     replyImages.mockReset().mockImplementation(async text => ({ text, attachments: [] }));
+    replyFiles.prepare.mockReset().mockImplementation(async text => ({ text, attachments: [] }));
     deps = { ensureLane: vi.fn(async () => ({ ok: true, sessionId: 'lane' })), abortLane: vi.fn(async () => {}),
       dispatch: vi.fn(async (input: Parameters<BotGroupChatServiceDeps['dispatch']>[0]) => { await input.onAccepted?.(); return { ok: true }; }),
       onChanged: vi.fn(),
@@ -163,6 +172,94 @@ describe('Chat Server result delivery and refresh', () => {
     service = withChatServer({ listGroups: vi.fn(async () => ({ ok: true, groups: [] })), settleLaneTurn: vi.fn(async () => false), dispose: vi.fn() } as unknown as BotGroupChatService, deps);
   });
   afterEach(() => { service.dispose(); vi.useRealTimers(); vi.unstubAllEnvs(); fixture.config = ''; vi.clearAllMocks(); });
+  describe('分工 auto-continue on this computer (bot-group-chat.md §7.4)', () => {
+    const planId = '80000000-0000-4000-8000-000000000009';
+    const otherHuman = '30000000-0000-4000-8000-000000000002';
+    const division = (over: Record<string, unknown> = {}, first = 'done') => ({ id: planId, revision: 3, kind: 'work',
+      source_message_id: execution.source_message_id, request_text: 'build it', organizer_id: botId, creator_id: selfId,
+      status: 'waiting', current_step: 0, created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z',
+      steps: [{ position: 0, botId, botName: 'Bot', task: 'draft', status: first }, { position: 1, botId, botName: 'Bot', task: 'polish', status: 'pending' }],
+      ...over });
+    const continues = () => fixture.handle.mock.calls.filter(([route, method, body]) =>
+      route === `/conversations/${roomId}/plans/${planId}` && method === 'POST' && (body as { action?: string })?.action === 'continue');
+    const stepEnded = async (cursor: string) => {
+      fixture.sockets[0]!.emit('message', JSON.stringify({ type: 'changes', scope: `conversation:${roomId}`, cursor,
+        changes: [{ type: 'execution.updated', entityId: execution.id }] }));
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    async function serve(plan: Record<string, unknown>, settings: { autoContinue?: boolean; startedHere?: string[] } | null,
+      onContinue?: () => { status: number; body: unknown }, onRead?: () => void) {
+      if (settings) workspaceSettings.set(roomId, { projectDir: null, plans: {}, startedHere: [planId], ...settings });
+      // Only a server that tells a 分工 from a queue (groupSingleSpeaker) offers the switch.
+      fixture.handle.mockImplementation((route, method) => route === `/conversations/${roomId}/plans/${planId}` && method === 'POST'
+        ? onContinue?.() ?? { body: {} } : route.startsWith(`/conversations/${roomId}/plans`) ? (onRead?.(), { body: [plan] })
+        : route === '/me' ? { body: { actor: { id: selfId }, capabilities: { groupSingleSpeaker: 1 } } } : response(route));
+      await service.getGroup(roomId);
+      await vi.advanceTimersByTimeAsync(2000);
+    }
+    it('goes on to the next step of a 分工 started here once a step is done', async () => {
+      await serve(division(), { autoContinue: true });
+      await stepEnded('2');
+      expect(continues()).toHaveLength(1);
+      expect(continues()[0]![2]).toMatchObject({ expectedRevision: 3 });
+    });
+    it('goes on with a step that ended before the room was first read (a cold start)', async () => {
+      await serve(division(), { autoContinue: true });
+      expect(continues()).toHaveLength(1);
+      // The same finished step is not continued twice when later changes arrive.
+      await stepEnded('3');
+      expect(continues()).toHaveLength(1);
+    });
+    it.each([
+      ['the switch is off', division(), { autoContinue: false }],
+      ['nothing was chosen on this computer', division(), null],
+      ['the step failed and waits for 重试', division({}, 'failed'), { autoContinue: true }],
+      ['someone else started the 分工', division({ creator_id: otherHuman }), { autoContinue: true }],
+      // The account is the creator on each of its computers: another one of them asked for this 分工.
+      ['it was asked for on another computer', division(), { autoContinue: true, startedHere: [] }],
+      ['it is a discussion queue, not a 分工', division({ kind: 'talk' }), { autoContinue: true }],
+      ['the 分工 was stopped', division({ status: 'stopped' }), { autoContinue: true }],
+      ['the last step is done', division({ current_step: 1, status: 'waiting', steps: [
+        { position: 0, botId, botName: 'Bot', task: 'draft', status: 'done' }, { position: 1, botId, botName: 'Bot', task: 'polish', status: 'done' }] }), { autoContinue: true }],
+    ])('keeps waiting for 继续 when %s', async (_case, plan, settings) => {
+      await serve(plan, settings);
+      await stepEnded('2');
+      expect(continues()).toHaveLength(0);
+    });
+    it('turning it on while a step waits goes on now, and shows the choice on the group and its 分工 card', async () => {
+      await serve(division(), { autoContinue: false });
+      const before = await service.getGroup(roomId);
+      expect(before.ok && [before.group.autoContinue, before.group.plans[0]?.autoContinue]).toEqual([false, false]);
+      expect(await service.updateGroup({ groupId: roomId, autoContinue: true })).toEqual({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(workspaceSettings.get(roomId)).toMatchObject({ autoContinue: true, projectDir: null });
+      expect(continues()).toHaveLength(1);
+      const after = await service.getGroup(roomId);
+      expect(after.ok && [after.group.autoContinue, after.group.plans[0]?.autoContinue]).toEqual([true, true]);
+    });
+    it('does not go on when the switch is turned off while the 分工 is read', async () => {
+      await serve(division(), { autoContinue: true }, undefined, () => {
+        workspaceSettings.set(roomId, { ...workspaceSettings.get(roomId) as object, autoContinue: false });
+      });
+      await stepEnded('2');
+      expect(continues()).toHaveLength(0);
+    });
+    it('turning it off while the 分工 is read stops the handoff before the group is re-read', async () => {
+      await serve(division(), { autoContinue: true }, undefined, () => { void service.updateGroup({ groupId: roomId, autoContinue: false }); });
+      expect(continues()).toHaveLength(0);
+    });
+    it('does not offer the switch on a server that cannot tell a 分工 from a queue', async () => {
+      workspaceSettings.set(roomId, { projectDir: null, plans: {}, autoContinue: true });
+      const result = await service.getGroup(roomId);
+      expect(result.ok && result.group).not.toHaveProperty('autoContinue');
+    });
+    it('does not try again after someone else went on first', async () => {
+      await serve(division(), { autoContinue: true }, () => ({ status: 409, body: { error: { code: 'REVISION_CONFLICT' } } }));
+      await stepEnded('2');
+      await stepEnded('3');
+      expect(continues()).toHaveLength(1);
+    });
+  });
   it('uses the mobile edited revision instead of a newer server snapshot when saving settings', async () => {
     await service.updateGroup({ groupId: roomId, name: 'Draft', expectedRevision: 7 });
     expect(fixture.handle).toHaveBeenCalledWith(`/conversations/${roomId}`, 'PATCH', expect.objectContaining({ name: 'Draft', expectedRevision: 7 }));
@@ -565,9 +662,9 @@ describe('Chat Server result delivery and refresh', () => {
 
   // Test value (#6906, unit): real withChatServer -> live authority -> HTTP entry.
   // Existing tests cover private-tool grants, not bot management identity, requester roles,
-  // confirmation waits or unknown mutation receipts. Minimal failure: an active owner bot
+  // queued read waits or unknown mutation receipts. Minimal failure: an active owner bot
   // asked to rename this group. All HTTP, profiles and members below are isolated fixtures.
-  // Standalone file: 7.35s wall (5.21s collection, 1.90s tests); existing 339-case fixture reused.
+  // Standalone file: 5.35s wall (3.59s collection, 1.52s tests); existing fixture reused.
   describe('current execution group management (#6906)', () => {
     const peerId = '60000000-0000-4000-8000-000000000001';
     const outsiderId = '60000000-0000-4000-8000-000000000002';
@@ -575,9 +672,8 @@ describe('Chat Server result delivery and refresh', () => {
     let members: Array<Record<string, unknown>>;
     let group: ReturnType<typeof room>;
     let mutate: (route: string, body: Record<string, unknown>) => unknown;
-    const confirm = vi.fn(async () => true);
-    const call = (action: import('@cindy/mcps').CurrentGroupMutation['action'], confirmation = confirm, guard = () => {}) =>
-      executeCurrentGroupTool('lane', { type: 'manage', mutation: { operationId, action } }, confirmation, guard);
+    const call = (action: import('@cindy/mcps').CurrentGroupMutation['action'], guard = () => {}) =>
+      executeCurrentGroupTool('lane', { type: 'manage', mutation: { operationId, action } }, guard);
     const writes = () => fixture.handle.mock.calls.filter(([, method, body]) => method !== 'GET' && body?.operationId === operationId);
     async function setup(botRole = 'owner', requester = selfId, requesterRole = 'member') {
       group = room(roomId);
@@ -585,7 +681,6 @@ describe('Chat Server result delivery and refresh', () => {
       members = [member(botId, 'bot', botRole, selfId), member(selfId, 'human', requester === selfId ? requesterRole : 'owner'), member(peerId, 'bot', 'member', outsiderId)];
       if (requester !== selfId) members.push(member(requester, 'human', requesterRole));
       mutate = () => ({ body: { revision: 2 } });
-      confirm.mockReset().mockResolvedValue(true);
       fixture.requests = [];
       fixture.handle.mockImplementation((route, method, body) => {
         if (route === '/me') return { body: { actor: { id: selfId }, capabilities: { groupLifecycleVersion: 1 } } };
@@ -599,7 +694,7 @@ describe('Chat Server result delivery and refresh', () => {
     }
     it.each(['owner', 'admin', 'member'])('queries live %s role and applies only this bot role', async role => {
       await setup(role);
-      expect(await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).toMatchObject({ ok: true, self: { actorId: botId, role }, permissions: { update: role !== 'member' } });
+      expect(await executeCurrentGroupTool('lane', { type: 'inspect' })).toMatchObject({ ok: true, self: { actorId: botId, role }, permissions: { update: role !== 'member' } });
       const result = await call({ type: 'update', name: 'Renamed', topic: 'Topic', description: 'Description', expectedRevision: 1 });
       expect(result.ok).toBe(role !== 'member');
       if (role !== 'member') {
@@ -607,11 +702,24 @@ describe('Chat Server result delivery and refresh', () => {
         expect(fixture.requests.find(r => r.url.endsWith('/conversations/' + roomId))?.actor).toBe(botId);
       } else expect(writes()).toHaveLength(0); // Even though the human owns a higher role.
     });
+    // #6944 review: even a live owner bot must reject removed actions at the
+    // Host boundary, not just hide them in MCP discovery. Unit, isolated HTTP.
+    it.each(['transfer', 'dissolve', 'owner-role'] as const)('rejects removed lifecycle capability %s before HTTP', async type => {
+      await setup();
+      const action = type === 'transfer' ? { type, actorId: peerId }
+        : type === 'dissolve' ? { type, expectedRevision: 1 }
+        : { type: 'member', action: 'role', actorId: peerId, role: 'owner' };
+      expect(await call(action as unknown as import('@cindy/mcps').CurrentGroupMutation['action'])).toMatchObject({ ok: false, errorCode: 'INVALID_INPUT' });
+      expect(writes()).toHaveLength(0);
+      const result = await executeCurrentGroupTool('lane', { type: 'inspect' });
+      expect(result.ok).toBe(true);
+      expect(result).not.toHaveProperty('permissions.transfer');
+      expect(result).not.toHaveProperty('permissions.dissolve');
+      expect(result).not.toHaveProperty('requiresConfirmation');
+    });
     it.each(['member', 'admin'])('keeps requester %s privileges separate from an owner bot', async role => {
       await setup('owner', outsiderId, role);
       expect(await call({ type: 'member', actorId: peerId, action: 'remove' })).toMatchObject({ ok: false, errorCode: 'GROUP_REQUESTER_AUTHORIZATION_UNSUPPORTED' });
-      expect(await call({ type: 'transfer', actorId: peerId })).toMatchObject({ ok: false, errorCode: 'GROUP_REQUESTER_AUTHORIZATION_UNSUPPORTED' });
-      expect(confirm).not.toHaveBeenCalled();
     });
     it.each(['bot-role', 'requester-left', 'access-revision', 'permission', 'execution-replaced'])('rejects current and queued mutations after %s revocation', async change => {
       await setup();
@@ -621,10 +729,14 @@ describe('Chat Server result delivery and refresh', () => {
       const waiting = new Promise<void>(resolve => { release = resolve; });
       let entered!: () => void;
       const entry = new Promise<void>(resolve => { entered = resolve; });
-      confirm.mockImplementation(async () => { entered(); await waiting; return true; });
-      const first = call({ type: 'transfer', actorId: peerId }, confirm, guard);
+      const original = fixture.handle.getMockImplementation()!;
+      fixture.handle.mockImplementation(async (route, method, body) => {
+        if (route.endsWith('/executions') && method === 'GET') { entered(); await waiting; return { body: [execution] }; }
+        return original(route, method, body);
+      });
+      const first = call({ type: 'execution', executionId: execution.id, action: 'stop' }, guard);
       await entry;
-      const queued = call({ type: 'member', actorId: peerId, action: 'remove' }, confirm, guard);
+      const queued = call({ type: 'member', actorId: peerId, action: 'remove' }, guard);
       if (change === 'bot-role') members[0].role = 'member';
       if (change === 'requester-left') members[1].state = 'left';
       if (change === 'access-revision') members[0].accessRevision = 2;
@@ -637,13 +749,13 @@ describe('Chat Server result delivery and refresh', () => {
       unregister();
       expect(writes()).toHaveLength(0);
     });
-    it.each(['owner-target', 'admin-transfer', 'admin-dissolve', 'cancel'])('protects %s before a destructive write', async mode => {
-      await setup(mode.startsWith('admin') ? 'admin' : 'owner');
+    it.each(['owner-target', 'admin-role'])('protects %s before a member write', async mode => {
+      await setup(mode === 'admin-role' ? 'admin' : 'owner');
       if (mode === 'owner-target') members[2].role = 'owner';
-      if (mode === 'cancel') confirm.mockResolvedValue(false);
-      const result = await call(mode === 'owner-target' ? { type: 'member', action: 'remove', actorId: peerId }
-        : mode === 'admin-dissolve' ? { type: 'dissolve', expectedRevision: 1 } : { type: 'transfer', actorId: peerId });
-      expect(result.ok).toBe(false); expect(writes()).toHaveLength(0);
+      const result = await call({ type: 'member', actorId: peerId,
+        ...(mode === 'owner-target' ? { action: 'remove' as const } : { action: 'role' as const, role: 'admin' as const }) });
+      expect(result).toMatchObject({ ok: false, errorCode: mode === 'owner-target' ? 'MEMBER_PROTECTED' : 'GROUP_OWNER_REQUIRED' });
+      expect(writes()).toHaveLength(0);
     });
     it('returns unknown after a lost write receipt and requires a query before any retry', async () => {
       await setup();
@@ -654,11 +766,11 @@ describe('Chat Server result delivery and refresh', () => {
       expect(writes()).toHaveLength(count);
       const original = fixture.handle.getMockImplementation()!;
       fixture.handle.mockImplementation((route, method, body) => route.endsWith('/executions') && method === 'GET' ? { body: null, rawBody: 'null' } : original(route, method, body));
-      expect((await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).ok).toBe(false);
+      expect((await executeCurrentGroupTool('lane', { type: 'inspect' })).ok).toBe(false);
       expect(await call({ type: 'update', expectedRevision: 1, name: 'Applied' })).toMatchObject({ ok: false, errorCode: 'GROUP_RESULT_UNKNOWN' });
       expect(writes()).toHaveLength(count);
       fixture.handle.mockImplementation(original);
-      expect(await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).toMatchObject({ ok: true, group: { name: 'Applied' } });
+      expect(await executeCurrentGroupTool('lane', { type: 'inspect' })).toMatchObject({ ok: true, group: { name: 'Applied' } });
     });
     // #6944: reconciliation reads the advanced revision after a lost response.
     // Unit, real Host/HTTP adapter: the retry must keep the exact idempotent payload.
@@ -674,7 +786,7 @@ describe('Chat Server result delivery and refresh', () => {
         : { type, expectedRevision: 1, planId, action: 'dismiss' as const };
       expect(await call(action)).toMatchObject({ ok: false, errorCode: 'GROUP_RESULT_UNKNOWN' });
       const first = writes()[0];
-      expect(await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).toMatchObject({ ok: true });
+      expect(await executeCurrentGroupTool('lane', { type: 'inspect' })).toMatchObject({ ok: true });
       mutate = () => ({ body: { revision: 2 } });
       expect(await call(action)).toMatchObject({ ok: true });
       expect(writes()).toHaveLength(2);
@@ -687,7 +799,7 @@ describe('Chat Server result delivery and refresh', () => {
       const original = fixture.handle.getMockImplementation()!;
       fixture.handle.mockImplementation((route, method, body) => method === 'GET' && route.endsWith('/executions')
         ? { body: [execution, other] } : original(route, method, body));
-      expect(await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).toMatchObject({ ok: true,
+      expect(await executeCurrentGroupTool('lane', { type: 'inspect' })).toMatchObject({ ok: true,
         currentExecution: { id: execution.id, sourceMessageId: execution.source_message_id },
         executions: [expect.objectContaining({ id: execution.id, sourceMessageId: execution.source_message_id }),
           expect.objectContaining({ id: other.id, sourceMessageId: other.source_message_id, planId: other.plan_id, planStep: 2 })] });
@@ -706,7 +818,7 @@ describe('Chat Server result delivery and refresh', () => {
       mutate = () => { group.archived = true; group.revision = 2; return { body: { revision: 2 } }; };
       expect(await call({ type: 'archive', archived: true, expectedRevision: 1 })).toMatchObject({ ok: true });
       expect(deps.abortLane).toHaveBeenCalledWith('lane');
-      expect((await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).ok).toBe(false);
+      expect((await executeCurrentGroupTool('lane', { type: 'inspect' })).ok).toBe(false);
       let key = 'private-input';
       const permission = { planModeEnabled: false, isCurrent: () => true };
       const recoveryDeps = {
@@ -775,7 +887,7 @@ describe('Chat Server result delivery and refresh', () => {
       fixture.handle.mockImplementation((route, method, body) => method === 'GET' && route.includes('/plans')
         ? { body: [{ id: planId, revision: 3, status: 'waiting', current_step: 1, steps: [{ position: 1, botId: peerId, botName: 'Analyst', task: 'Check report', status: 'pending', resultMessageId: 'not-projected' }] }] }
         : original(route, method, body));
-      const inspected = await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm);
+      const inspected = await executeCurrentGroupTool('lane', { type: 'inspect' });
       expect(inspected).toMatchObject({ ok: true, members: expect.arrayContaining([{ actorId: peerId, kind: 'bot', name: 'Analyst', role: 'member', state: 'joined', ownerActorId: outsiderId, ownerName: 'Chris' }]),
         plans: [{ id: planId, revision: 3, status: 'waiting', currentStep: 1, steps: [{ position: 1, botActorId: peerId, botName: 'Analyst', task: 'Check report', status: 'pending' }] }] });
       expect(await call({ type: 'plan', planId, expectedRevision: 3, action: 'reassign', position: 1, botId })).toMatchObject({ ok: true });
@@ -790,7 +902,7 @@ describe('Chat Server result delivery and refresh', () => {
         : original(route, method, body));
       fixture.profiles.push({ id: 'new-local-bot', displayName: 'New Bot', status: 'active' });
       await vi.advanceTimersByTimeAsync(5001);
-      const inspected = await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm);
+      const inspected = await executeCurrentGroupTool('lane', { type: 'inspect' });
       expect(inspected).toMatchObject({ ok: true, invitableBots: requester === selfId ? [{ actorId: peerId, botId: 'new-local-bot', name: 'New Bot' }] : [] });
       if (requester === selfId) {
         expect(await call({ type: 'member', actorId: peerId, action: 'invite' })).toMatchObject({ ok: true });
@@ -825,12 +937,12 @@ describe('Chat Server result delivery and refresh', () => {
       expect(result.ok).toBe(status === 200);
       if (status === 200) {
         expect(deps.abortLane).toHaveBeenCalledExactlyOnceWith('lane');
-        expect((await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).ok).toBe(false);
+        expect((await executeCurrentGroupTool('lane', { type: 'inspect' })).ok).toBe(false);
       } else expect(deps.abortLane).not.toHaveBeenCalled();
     });
     // Other successful writes can revoke leases too; no websocket or timer should
     // be needed to reconcile the server's decision. A still-valid lease must stay live.
-    it.each(['archive', 'dissolve', 'plan', 'member', 'still-valid'] as const)('immediately rechecks local leases after %s management', async type => {
+    it.each(['archive', 'plan', 'member', 'still-valid'] as const)('immediately rechecks local leases after %s management', async type => {
       await setup(); fixture.sockets[0].emit('close');
       let applied = false;
       const planId = '80000000-0000-4000-8000-000000000001';
@@ -840,41 +952,36 @@ describe('Chat Server result delivery and refresh', () => {
         if (applied && body?.action === 'heartbeat' && type !== 'still-valid') return { status: 409, body: { error: { code: 'STALE_EXECUTOR' } } };
         return original(route, method, body);
       });
-      mutate = () => { applied = true; return { body: type === 'dissolve'
-        ? { revision: 2, dissolvedAt: '2026-10-23T00:00:00Z', dissolvedBy: botId } : { revision: 2 } }; };
+      mutate = () => { applied = true; return { body: { revision: 2 } }; };
       const action = type === 'archive' ? { type, archived: true, expectedRevision: 1 }
-        : type === 'dissolve' ? { type, expectedRevision: 1 }
         : type === 'plan' ? { type, planId, expectedRevision: 1, action: 'stop' as const }
         : type === 'member' ? { type, actorId: peerId, action: 'ban' as const }
         : { type: 'update' as const, name: 'Renamed', expectedRevision: 1 };
       expect(await call(action)).toMatchObject({ ok: true });
       expect(deps.abortLane).toHaveBeenCalledTimes(type === 'still-valid' ? 0 : 1);
-      if (type !== 'still-valid') expect((await executeCurrentGroupTool('lane', { type: 'inspect' }, confirm)).ok).toBe(false);
+      if (type !== 'still-valid') expect((await executeCurrentGroupTool('lane', { type: 'inspect' })).ok).toBe(false);
     });
     it('allows re-inviting a former owner while protecting a joined owner', async () => {
       await setup(); members[2].role = 'owner'; members[2].state = 'left';
       expect(await call({ type: 'member', actorId: peerId, action: 'invite' })).toMatchObject({ ok: true });
       members[2].state = 'joined';
       expect(await executeCurrentGroupTool('lane', { type: 'manage', mutation: { operationId: '70000000-0000-4000-8000-000000000002',
-        action: { type: 'member', actorId: peerId, action: 'invite' } } }, confirm)).toMatchObject({ ok: false, errorCode: 'MEMBER_PROTECTED' });
+        action: { type: 'member', actorId: peerId, action: 'invite' } } })).toMatchObject({ ok: false, errorCode: 'MEMBER_PROTECTED' });
       expect(writes()).toHaveLength(1);
     });
-    it.each(['member', 'archive', 'createInvite', 'revokeInvite', 'transfer', 'dissolve'] as const)('executes %s as the current bot with the original operation id', async type => {
+    it.each(['member', 'archive', 'createInvite', 'revokeInvite'] as const)('executes %s as the current bot with the original operation id', async type => {
       await setup();
       const token = 'a'.repeat(43);
       mutate = route => ({ body: route.endsWith('/invite-links') ? { token, expiresAt: null, reusable: true }
-        : route.endsWith('/revoke') ? { revoked: true } : route.endsWith('/dissolve') ? { revision: 2, dissolvedAt: '2026-10-23T00:00:00Z', dissolvedBy: botId } : { revision: 2 } });
+        : route.endsWith('/revoke') ? { revoked: true } : { revision: 2 } });
       const action = type === 'member' ? { type, actorId: peerId, action: 'remove' as const }
         : type === 'archive' ? { type, expectedRevision: 1, archived: true }
-        : type === 'transfer' ? { type, actorId: peerId }
-        : type === 'dissolve' ? { type, expectedRevision: 1 }
         : type === 'revokeInvite' ? { type, link: 'cindy://chat-invite/' + token } : { type };
       expect(await call(action)).toMatchObject({ ok: true, operationId });
       const write = writes().at(-1)!;
       expect(write[2]).toMatchObject({ operationId });
       expect(fixture.requests.filter(r => new URL(r.url).pathname === '/v1' + write[0]).at(-1)?.actor).toBe(botId);
       if (type === 'revokeInvite') expect(write[2]).toEqual({ operationId, token });
-      expect(confirm).toHaveBeenCalledTimes(['transfer', 'dissolve'].includes(type) ? 1 : 0);
     });
   });
 
@@ -943,6 +1050,210 @@ describe('Chat Server result delivery and refresh', () => {
     expect(replyImages).toHaveBeenCalledOnce(); expect(deps.dispatch).toHaveBeenCalledOnce();
   });
 
+  // #6761: ordinary reply files must reach the completion payload, not remain local links.
+  it.each(['revision', 'revoked', 'requester-left', 'lease', 'temporary'])('refuses reply files when %s changes after the last tool call', async change => {
+    let revoked = false;
+    fixture.handle.mockImplementation((route, _method, body) => {
+      if (route === '/executions/claim') {
+        const next = claimed ? null : { ...execution, requester_id: selfId, access_mode: 'tools' };
+        claimed = true; return { body: { execution: next } };
+      }
+      if (revoked && change === 'temporary' && route.endsWith('/members')) return { status: 503, body: { code: 'UNAVAILABLE' } };
+      if (route.endsWith('/members')) return { body: [
+        { id: botId, kind: 'bot', ownerActorId: selfId, state: 'joined',
+          accessRevision: revoked && change === 'revision' ? 2 : 1, guestAccess: revoked && change === 'revoked' ? 'chat' : 'tools' },
+        { id: selfId, kind: 'human', ownerActorId: selfId, state: revoked && change === 'requester-left' ? 'left' : 'joined' },
+      ] };
+      if (revoked && change === 'lease' && body?.action === 'heartbeat') return { status: 409, body: { code: 'STALE_EXECUTION' } };
+      return response(route);
+    });
+    replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [{ id: 'pdf', name: 'report.pdf' }] });
+    await start();
+    await authorizeGroupTool('lane', 'local-bot', 'read-self');
+    revoked = true;
+    const uploads = fixture.upload.mock.calls.length;
+    await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+    expect(fixture.upload.mock.calls.length).toBe(uploads);
+    // Shared-reference classification can read bytes; it must wait for current authority.
+    expect(replyImages).not.toHaveBeenCalled();
+    expect(deliveries()).toHaveLength(0);
+    if (change === 'temporary') revoked = false;
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(fixture.upload.mock.calls.length).toBe(uploads + (change === 'temporary' ? 1 : 0));
+    expect(deliveries()).toHaveLength(change === 'temporary' ? 1 : 0);
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+  });
+
+  it.each(['members', 'heartbeat'].flatMap(boundary =>
+    ['TOKEN_EXPIRED', 'INVALID_TOKEN', 'AUTH_REQUIRED', 'INVALID_CHAT_RESPONSE'].map(code => [boundary, code])))
+  ('retains reply files through refreshable 401 at %s (%s)', async (boundary, code) => {
+    let denied = false;
+    fixture.refresh.mockResolvedValue(false);
+    fixture.handle.mockImplementation((route, _method, body) => {
+      if (route === '/executions/claim') {
+        const next = claimed ? null : { ...execution, requester_id: selfId, access_mode: 'owner' };
+        claimed = true; return { body: { execution: next } };
+      }
+      if (denied && (boundary === 'members' ? route.endsWith('/members') : body?.action === 'heartbeat'))
+        return code === 'INVALID_CHAT_RESPONSE' ? { status: 401, rawBody: '<html>unavailable</html>' }
+          : { status: 401, body: { error: { code } } };
+      if (route.endsWith('/members')) return { body: [
+        { id: botId, kind: 'bot', ownerActorId: selfId, state: 'joined', accessRevision: 1, guestAccess: 'tools' },
+        { id: selfId, kind: 'human', ownerActorId: selfId, state: 'joined' },
+      ] };
+      return response(route);
+    });
+    replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [{ id: 'pdf', name: 'report.pdf' }] });
+    await start();
+    denied = true;
+    await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+    expect(fixture.upload).not.toHaveBeenCalled();
+    expect(deliveries()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(58_000);
+    expect(fixture.upload).not.toHaveBeenCalled();
+    denied = false;
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fixture.upload).toHaveBeenCalledOnce();
+    expect(deliveries()).toHaveLength(1);
+    expect(replyFiles.prepare).toHaveBeenCalledOnce();
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(deliveries()).toHaveLength(1);
+  });
+
+  async function startFileReply() {
+    const original = fixture.handle.getMockImplementation()!;
+    fixture.handle.mockImplementation((route, method, body) => {
+      const result = original(route, method, body);
+      if (route === '/executions/claim' && result?.body?.execution) {
+        result.body.execution = { ...result.body.execution, access_mode: 'owner', requester_id: selfId };
+      }
+      if (route.endsWith('/members')) return { body: [
+        { id: botId, kind: 'bot', ownerActorId: selfId, state: 'joined', accessRevision: 1, guestAccess: 'tools' },
+        { id: selfId, kind: 'human', ownerActorId: selfId, state: 'joined' },
+      ] };
+      return result;
+    });
+    await start();
+  }
+
+  it('delivers a PDF reply and retries a lost completion ACK without another upload', async () => {
+    const file = { id: 'pdf', name: 'report.pdf', category: 'file', mimeType: 'application/pdf', size: 0, path: null, url: null };
+    replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [file] });
+    fixture.upload.mockResolvedValueOnce([{ type: 'media', mediaId: 'pdf', caption: 'report.pdf' }]);
+    let attempts = 0;
+    fixture.handle.mockImplementation((route, _method, body) => {
+      if (body?.action === 'complete' && ++attempts === 1) throw new Error('ECONNRESET');
+      return response(route);
+    });
+    await startFileReply();
+    const uploads = fixture.upload.mock.calls.length;
+    await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+    expect(deliveries()[0][2].content).toEqual([{ type: 'text', text: 'Report' }, { type: 'media', mediaId: 'pdf', caption: 'report.pdf' }]);
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(deliveries()).toHaveLength(2);
+    expect(deliveries()[1][2]).toEqual(deliveries()[0][2]);
+    expect(fixture.upload.mock.calls.length - uploads).toBe(1);
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+  });
+
+  it.each([20, 0])('keeps file/image source order across an upload retry (image offset %s)', async imageOffset => {
+    const first = { id: 'pdf', name: 'report.pdf', category: 'file', sourceOffset: 0 };
+    const last = { id: 'json', name: 'data.json', sourceOffset: 80 };
+    const image = { ...replyImage, sourceOffset: imageOffset };
+    replyFiles.prepare.mockResolvedValue({ text: 'report chart data', attachments: [first, last] });
+    replyImages.mockResolvedValue({ text: 'Delivered', attachments: [image] });
+    fixture.upload.mockRejectedValueOnce(Object.assign(new Error('MEDIA_UPLOAD_FAILED'), { status: 503 }))
+      .mockResolvedValue([first, image, last].map(file => ({ type: 'media', mediaId: file.id })));
+    await startFileReply();
+    const before = fixture.upload.mock.calls.length;
+    await service.settleLaneTurn({ ...terminal, resultText: '[report](./report.pdf) ![chart](image) [data](./data.json)' });
+    await vi.advanceTimersByTimeAsync(16000);
+    const uploads = fixture.upload.mock.calls.slice(before);
+    expect(uploads).toHaveLength(2);
+    for (const call of uploads) expect(call[2]).toEqual([first, image, last]);
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+  });
+
+  it('deduplicates eleven image/file aliases before counting and keeps the first source position on retry', async () => {
+    const images = Array.from({ length: 11 }, (_, i) => ({ ...replyImage, id: `image-${i}`, sourceOffset: 100 + i,
+      sourcePaths: [`/task/chart-${i}.png`] }));
+    const aliases = images.map((image, i) => ({ ...image, id: `file-${i}`, category: 'file', sourceOffset: i }));
+    const pdf = { id: 'pdf', name: 'report.pdf', category: 'file', sourceOffset: 50 };
+    replyFiles.prepare.mockResolvedValue({ text: 'Report charts', attachments: [...aliases, pdf] });
+    replyImages.mockResolvedValue({ text: 'Delivered', attachments: images });
+    fixture.upload.mockRejectedValueOnce(Object.assign(new Error('MEDIA_UPLOAD_FAILED'), { status: 503 })).mockResolvedValue([]);
+    await startFileReply();
+    const before = fixture.upload.mock.calls.length;
+    await service.settleLaneTurn({ ...terminal, resultText: '[download](chart.png) ![preview](chart.png)' });
+    await vi.advanceTimersByTimeAsync(16000);
+    const uploads = fixture.upload.mock.calls.slice(before);
+    expect(uploads).toHaveLength(2);
+    for (const call of uploads) {
+      expect(call[2].map(a => a.id)).toEqual([...images.map(a => a.id), 'pdf']);
+      expect(call[2].map(a => a.sourceOffset)).toEqual([...aliases.map(a => a.sourceOffset), 50]);
+    }
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+  });
+
+  it('delivers ten images and a PDF in one completion across an upload retry', async () => {
+    const images = Array.from({ length: 10 }, (_, i) => ({ ...replyImage, id: `image-${i}` }));
+    const pdf = { id: 'pdf', name: 'report.pdf' };
+    replyFiles.prepare.mockResolvedValue({ text: 'Images and report', attachments: [pdf] });
+    replyImages.mockResolvedValue({ text: 'Delivered', attachments: images });
+    const blocks = [...images, pdf].map(file => ({ type: 'media', mediaId: file.id }));
+    fixture.upload.mockRejectedValueOnce(Object.assign(new Error('MEDIA_UPLOAD_FAILED'), { status: 503 })).mockResolvedValue(blocks);
+    await startFileReply();
+    await service.settleLaneTurn({ ...terminal, resultText: '![image](cindy-media://image) [Report](./report.pdf)' });
+    expect(deliveries()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(fixture.upload).toHaveBeenLastCalledWith(roomId, expect.any(String), [...images, pdf], expect.any(String), expect.any(Function));
+    expect(deliveries()).toHaveLength(1);
+    expect(deliveries()[0][2].content).toEqual([{ type: 'text', text: 'Delivered' }, ...blocks]);
+    expect(replyFiles.prepare).toHaveBeenCalledOnce(); expect(replyImages).toHaveBeenCalledOnce();
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+  });
+
+  it('refuses mixed attachments exceeding the shared twenty-file limit before upload', async () => {
+    replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [{ id: 'pdf' }] });
+    replyImages.mockResolvedValue({ text: 'Images', attachments: Array.from({ length: 20 }, (_, i) => ({ ...replyImage, id: `image-${i}` })) });
+    await startFileReply();
+    const uploads = fixture.upload.mock.calls.length;
+    await service.settleLaneTurn({ ...terminal, resultText: 'Images and PDF' });
+    expect(fixture.upload.mock.calls.length).toBe(uploads);
+    expect(deliveries()).toHaveLength(0);
+    expect(fixture.handle.mock.calls.filter(([, , body]) => body?.action === 'fail')).toHaveLength(1);
+  });
+
+  it('fails a refused reply file instead of publishing a successful local path', async () => {
+    replyFiles.prepare.mockRejectedValue(new Error('ATTACHMENT_UNAVAILABLE'));
+    await startFileReply();
+    await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+    expect(deliveries()).toHaveLength(0);
+    expect(fixture.handle.mock.calls.filter(([, , body]) => body?.action === 'fail')).toHaveLength(1);
+  });
+
+  it.each([400, 413, 415, 422])('reports a file rejected by the media service (%s)', async status => {
+    replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [{ id: 'pdf', name: 'report.pdf' }] });
+    fixture.upload.mockRejectedValueOnce(new ChatResponseError('FILE_REFUSED', status));
+    await startFileReply();
+    await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+    expect(deliveries()).toHaveLength(0);
+    expect(fixture.handle.mock.calls.filter(([, , body]) => body?.action === 'fail')).toHaveLength(1);
+  });
+
+  it('retries a transient file upload without preparing files or running the Agent again', async () => {
+    replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [{ id: 'pdf', name: 'report.pdf' }] });
+    fixture.upload.mockRejectedValueOnce(Object.assign(new Error('MEDIA_UPLOAD_FAILED'), { status: 503 }))
+      .mockResolvedValueOnce([{ type: 'media', mediaId: 'pdf', caption: 'report.pdf' }]);
+    await startFileReply();
+    await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+    expect(deliveries()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(deliveries()[0][2].content).toEqual([{ type: 'text', text: 'Report' }, { type: 'media', mediaId: 'pdf', caption: 'report.pdf' }]);
+    expect(replyFiles.prepare).toHaveBeenCalledOnce();
+    expect(deps.dispatch).toHaveBeenCalledOnce();
+  });
 
   it.each([{ codexErrorInfo: 'serverOverloaded' }, { reason: 'upstream-overload' }, { errorStatus: 529 }])
     ('submits only the capacity category after the SDK terminal %j', async signals => {
@@ -1930,24 +2241,178 @@ describe('Chat Server result delivery and refresh', () => {
       expect(deliveries()[0][2]).not.toHaveProperty('continueDiscussion');
     });
 
-    it('sends without holding the request for a helper-model arrangement decision', async () => {
-      singleSpeaker();
-      deps.decidePlan = vi.fn() as typeof deps.decidePlan;
-      expect(await service.sendMessage({ groupId: roomId, text: 'Make a draft', clientId: 'single-speaker-send', mentions: { all: false, botIds: [] }, division: true }))
-        .toMatchObject({ ok: true });
-      await vi.advanceTimersByTimeAsync(0);
-      const post = fixture.handle.mock.calls.find(([route, method]) => route === `/conversations/${roomId}/messages` && method === 'POST')!;
-      expect(post[2].deferExecution).toBe(false);
-      expect(deps.decidePlan).not.toHaveBeenCalled();
+    it.each(['talk', 'work'] as const)('delivers explicit files for talk replies without changing the work pipeline (%s)', async kind => {
+      const planId = '80000000-0000-4000-8000-000000000001';
+      const plan = { id: planId, revision: 1, source_message_id: execution.source_message_id, request_text: 'Report', organizer_id: botId, creator_id: selfId,
+        status: 'running', current_step: 0, kind, steps: [{ position: 0, botId, botName: 'Bot', task: 'report', status: 'running' }] };
+      singleSpeaker(route => {
+        if (route === '/executions/claim' && !claimed) { claimed = true; return { body: { execution: { ...execution, access_mode: kind === 'talk' ? 'owner' : 'chat', plan_id: planId, plan_step: 0 } } }; }
+        if (route.includes('/plans?ids=')) return { body: [plan] };
+        if (route.endsWith(`/messages/${execution.source_message_id}`)) return { body: message(execution.source_message_id, 'Report') };
+        return undefined;
+      });
+      replyFiles.prepare.mockResolvedValue({ text: 'Report', attachments: [{ id: 'pdf', name: 'report.pdf' }] });
+      fixture.upload.mockImplementationOnce(async () => kind === 'talk' ? [{ type: 'media', mediaId: 'pdf', caption: 'report.pdf' }] : []);
+      if (kind === 'talk') await startFileReply(); else await start();
+      await service.settleLaneTurn({ ...terminal, resultText: '[Report](./report.pdf)' });
+      expect(deliveries()[0][2]).not.toHaveProperty('continueDiscussion');
+      if (kind === 'talk') {
+        expect(deliveries()[0][2].content).toEqual([{ type: 'text', text: 'Report' }, { type: 'media', mediaId: 'pdf', caption: 'report.pdf' }]);
+      } else {
+        expect(replyFiles.prepare).not.toHaveBeenCalled();
+        expect(deliveries()[0][2].content).toEqual([{ type: 'text', text: '[Report](./report.pdf)' }]);
+      }
     });
 
+    // A queue turn builds on the answer just before it (a 分工 hand-off's 2000 characters); older
+    // answers get a main-group message's 600, so a long queue does not resend every answer in full.
+    it('shortens the earlier answers a queue turn reads', async () => {
+      const planId = '80000000-0000-4000-8000-000000000003';
+      const ids = ['50000000-0000-4000-8000-000000000041', '50000000-0000-4000-8000-000000000042', '50000000-0000-4000-8000-000000000043'];
+      const texts = ['a'.repeat(601), 'b'.repeat(600), 'c'.repeat(2001)];
+      const plan = { id: planId, revision: 1, source_message_id: execution.source_message_id, request_text: 'Q', organizer_id: otherBot, creator_id: selfId,
+        note_message_ids: [], status: 'running', current_step: 3, kind: 'talk', created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z',
+        steps: [...ids.map((resultMessageId, position) => ({ position, botId: otherBot, botName: 'Peer', task: '', status: 'done', resultMessageId })),
+          { position: 3, botId, botName: 'Bot', task: '', status: 'running' }] };
+      singleSpeaker(route => {
+        if (route === '/executions/claim' && !claimed) { claimed = true; return { body: { execution: { ...execution, access_mode: 'owner', plan_id: planId, plan_step: 3 } } }; }
+        if (route.includes('/plans?ids=')) return { body: [plan] };
+        if (route.includes('/messages?all=true')) return { body: ids.map((id, index) => message(id, texts[index]!, { authorId: otherBot, author: { kind: 'bot', name: 'Peer' }, origin: 'bot' })) };
+        if (route.endsWith(`/messages/${execution.source_message_id}`)) return { body: message(execution.source_message_id, 'Q') };
+        return undefined;
+      });
+      await start();
+      const block = prompt().split('<untrusted-data>\n').map(part => part.split('\n</untrusted-data>')[0]!).find(part => part.includes('earlierAnswers'))!;
+      expect(JSON.parse(block).earlierAnswers).toEqual([
+        { from: 'Peer', text: `${'a'.repeat(600)}…`, shortened: true },
+        { from: 'Peer', text: 'b'.repeat(600) },
+        { from: 'Peer', text: `${'c'.repeat(2000)}…`, shortened: true },
+      ]);
+    });
+
+    // bot-group-chat.md §7.0 (2026-10-23): 「安排分工」 is back on these servers. A request that writes
+    // out who does what becomes that card and starts, with no helper model; otherwise the organizer
+    // arranges it. The request is held so the server's own queue does not answer it first.
+    describe('安排分工', () => {
+      const sourceId = '50000000-0000-4000-8000-000000000031', planId = '80000000-0000-4000-8000-000000000031';
+      const named = () => members().map(m => m.id === otherBot ? { ...m, name: 'Nova' } : m);
+      function divisionServer(open: object[] = []) {
+        singleSpeaker((route, method) => {
+          if (route.endsWith('/snapshot')) return { body: { room: room(roomId), members: named(), messages: [], cursor: '1' } };
+          if (route === `/conversations/${roomId}/messages` && method === 'POST') return { body: { id: sourceId } };
+          if (route === `/conversations/${roomId}/plans` && method === 'POST') return { body: { id: planId, revision: 1 } };
+          if (route === `/conversations/${roomId}/plans`) return { body: open };
+          return undefined;
+        });
+      }
+      const posts = () => fixture.handle.mock.calls.filter(([, method]) => method === 'POST');
+      const send = async (text: string) => {
+        expect(await service.sendMessage({ groupId: roomId, text, clientId: `division-${text.length}`, mentions: { all: false, botIds: [] }, division: true }))
+          .toMatchObject({ ok: true });
+        await vi.advanceTimersByTimeAsync(0);
+      };
+
+      it('starts the card a request writes out, without the organizer', async () => {
+        divisionServer();
+        deps.decidePlan = vi.fn() as typeof deps.decidePlan;
+        await send('登录页：@Bot (Owner) 出方案，然后 @Nova (Owner) 按方案实现');
+        expect(posts().find(([route]) => route === `/conversations/${roomId}/messages`)![2]).toMatchObject({ deferExecution: true });
+        expect(posts().find(([route]) => route === `/conversations/${roomId}/plans`)![2]).toMatchObject({ sourceMessageId: sourceId,
+          steps: [{ botId, task: '出方案' }, { botId: otherBot, task: '按方案实现' }] });
+        expect(posts().find(([route]) => route === `/conversations/${roomId}/plans/${planId}`)![2]).toMatchObject({ action: 'start', expectedRevision: 1 });
+        expect(deps.decidePlan).not.toHaveBeenCalled();
+        // Only a 分工 asked for here follows this computer's 自动交接.
+        expect(workspaceSettings.get(roomId)).toMatchObject({ startedHere: [planId] });
+      });
+
+      it('lets the organizer arrange it when a picked teammate no longer reads in the text', async () => {
+        divisionServer();
+        deps.decidePlan = vi.fn(async () => ({ needsPlan: true as const, steps: [{ botId, task: 'design' }, { botId: otherBot, task: 'build' }] }));
+        // Bot was picked as @OldName and renamed before sending: its step must not be dropped.
+        expect(await service.sendMessage({ groupId: roomId, text: '@OldName 出方案，然后 @Nova (Owner) 按方案实现', clientId: 'division-renamed',
+          mentions: { all: false, botIds: [botId, otherBot] }, division: true })).toMatchObject({ ok: true });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(deps.decidePlan).toHaveBeenCalled();
+        expect(posts().some(([route]) => route === `/conversations/${roomId}/plans/${planId}`)).toBe(false);
+      });
+
+      it('answers the request when nobody can arrange it, and later messages still go out', async () => {
+        divisionServer();
+        deps.decidePlan = undefined;
+        await send('Make a draft');
+        expect(posts().some(([route]) => route === `/conversations/${roomId}/messages/${sourceId}/continue`)).toBe(true);
+        expect(await service.sendMessage({ groupId: roomId, text: 'Another thing', clientId: 'after-no-organizer', mentions: { all: false, botIds: [] } }))
+          .toMatchObject({ ok: true });
+      });
+
+      // §4.0: in a mention-only group an unaddressed message wakes nobody, not even the helper revising your proposed card.
+      it.each([['all', true], ['mentioned', false]] as const)('in %s mode, unaddressed words revise your proposed card: %s', async (mode, revises) => {
+        const proposed = { id: planId, revision: 1, source_message_id: execution.source_message_id, request_text: 'Q', organizer_id: botId, creator_id: selfId,
+          note_message_ids: [], status: 'proposed', current_step: null, kind: 'work', created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z',
+          steps: [{ position: 0, botId, botName: 'Bot', task: 'draft', status: 'pending' }] };
+        singleSpeaker((route, method) => {
+          if (route.endsWith('/snapshot')) return { body: { room: { ...room(roomId), response_mode: mode }, members: named(), messages: [], cursor: '1' } };
+          if (route === `/conversations/${roomId}/messages` && method === 'POST') return { body: { id: sourceId } };
+          if (route === `/conversations/${roomId}/plans`) return { body: [proposed] };
+          return undefined;
+        });
+        deps.decidePlan = vi.fn(async () => null);
+        expect(await service.sendMessage({ groupId: roomId, text: 'Make it shorter', clientId: `revise-${mode}`, mentions: { all: false, botIds: [] } }))
+          .toMatchObject({ ok: true });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(posts().find(([route]) => route === `/conversations/${roomId}/messages`)![2]).toMatchObject({ deferExecution: revises });
+        expect(vi.mocked(deps.decidePlan!).mock.calls.length > 0).toBe(revises);
+      });
+
+      // The server cannot release a held request, so a newer message must not replace one still being arranged.
+      it('refuses a newer message while the organizer is arranging', async () => {
+        divisionServer();
+        deps.decidePlan = vi.fn(() => new Promise<never>(() => {}));
+        await send('Make a draft');
+        expect(await service.sendMessage({ groupId: roomId, text: 'Another thing', clientId: 'after-division', mentions: { all: false, botIds: [] } }))
+          .toMatchObject({ ok: false, errorCode: 'PLAN_OPEN' });
+        expect(posts().filter(([route]) => route === `/conversations/${roomId}/messages`)).toHaveLength(1);
+      });
+
+      it('asks the organizer when the steps are not written out', async () => {
+        divisionServer();
+        deps.decidePlan = vi.fn(async () => ({ needsPlan: true as const, steps: [{ botId: otherBot, task: 'build' }] }));
+        await send('@Bot (Owner) 和 @Nova (Owner) 一起做登录页');
+        expect(deps.decidePlan).toHaveBeenCalledWith(expect.objectContaining({ mode: 'forced' }), expect.anything());
+        expect(posts().find(([route]) => route === `/conversations/${roomId}/plans`)![2]).toMatchObject({ steps: [{ botId: otherBot, task: 'build' }] });
+        expect(posts().some(([route]) => route === `/conversations/${roomId}/plans/${planId}`)).toBe(false);
+      });
+
+      it('answers the request at once when no card comes of it, instead of a queue two minutes later', async () => {
+        divisionServer();
+        deps.decidePlan = vi.fn(async () => { throw new Error('model unavailable'); });
+        await send('Make a draft');
+        expect(posts().some(([route]) => route === `/conversations/${roomId}/messages/${sourceId}/continue`)).toBe(true);
+      });
+
+      it('ends your queue waiting for 继续 before opening the card', async () => {
+        const queue = { id: '80000000-0000-4000-8000-000000000032', revision: 4, source_message_id: execution.source_message_id, request_text: 'Q', organizer_id: botId,
+          creator_id: selfId, note_message_ids: [], status: 'waiting', current_step: 4, kind: 'talk', created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z',
+          steps: [{ position: 4, botId, botName: 'Bot', task: '', status: 'done' }] };
+        divisionServer([queue]);
+        await send('@Bot (Owner) 出方案');
+        const routes = posts().map(([route]) => route);
+        expect(routes.indexOf(`/conversations/${roomId}/plans/${queue.id}`)).toBeLessThan(routes.indexOf(`/conversations/${roomId}/plans`));
+        expect(posts().find(([route]) => route === `/conversations/${roomId}/plans/${queue.id}`)![2]).toMatchObject({ action: 'stop', expectedRevision: 4 });
+      });
+    });
+
+    // Words for a card under way reach its current step when they would wake anyone: the requester
+    // adding to a turn, or asking the teammate who just finished a 分工 step to redo it (§4.0, §7.4).
     it.each([
       ['waiting for 继续: a new request replaces it', 'waiting', `/conversations/${roomId}/messages`],
       ['mid-turn: the words go to the teammate answering', 'running', `/conversations/${roomId}/plans/80000000-0000-4000-8000-000000000002/messages`],
-      ['mention-only mid-turn: unmentioned words stay ordinary messages', 'running', `/conversations/${roomId}/messages`, 'mentioned'],
-    ] as const)('with an open queue %s', async (_label, status, route, responseMode: string = 'all') => {
+      ['mention-only mid-turn: unmentioned words stay ordinary messages', 'running', `/conversations/${roomId}/messages`, 'talk', 'mentioned'],
+      ['of a 分工 waiting for 继续: a redo for its teammate', 'waiting', `/conversations/${roomId}/plans/80000000-0000-4000-8000-000000000002/messages`, 'work'],
+      ['of a 分工 waiting for 继续 in a mention-only group: an ordinary message', 'waiting', `/conversations/${roomId}/messages`, 'work', 'mentioned'],
+    ] as const)('with an open card %s', async (_label, status, route, kind: 'talk' | 'work' = 'talk', responseMode: 'all' | 'mentioned' = 'all') => {
       const queue = { id: '80000000-0000-4000-8000-000000000002', revision: 1, source_message_id: execution.source_message_id, request_text: 'Q', organizer_id: botId,
-        creator_id: selfId, note_message_ids: [], status, current_step: 0, kind: 'talk', created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z',
+        creator_id: selfId, note_message_ids: [], status, current_step: 0, kind, created_at: '2026-10-03T00:00:00Z', updated_at: '2026-10-03T00:00:00Z',
         steps: [{ position: 0, botId, botName: 'Bot', task: '', status: status === 'waiting' ? 'done' : 'running' }, { position: 1, botId: otherBot, botName: 'Peer', task: '', status: 'pending' }] };
       singleSpeaker(route => route === `/conversations/${roomId}/plans` ? { body: [queue] }
         : route.endsWith('/snapshot') ? { body: { room: { ...room(roomId), response_mode: responseMode }, members: members(), messages: [], cursor: '1' } } : undefined);
@@ -2138,6 +2603,8 @@ describe('Chat Server result delivery and refresh', () => {
     await service.listGroups();
     const result = await service.getGroup(roomId);
     expect(result.ok && result.group.members[0]).toMatchObject({ botId: 'local-bot', isOwned: true, homeDeviceId: 'home-pc' });
+    // No organizer chosen yet: settings select the first companion, so it must be its local ID.
+    expect(result.ok && result.group.organizerBotId).toBe('local-bot');
   });
   it('projects hidden paused local companions with their real local identity and never claims work for them', async () => {
     fixture.profiles = [{ id: 'local-bot', displayName: 'Bot', status: 'paused', hiddenAt: 1 }];
@@ -3511,6 +3978,33 @@ describe('Chat Server result delivery and refresh', () => {
       expect(vi.mocked(socket.send).mock.calls.filter(([raw]) => String(raw).includes(groupId))).toEqual([]);
     });
 
+    // Notification landing explicitly opts into direct read/send. Previously the real
+    // getGroup entry rejected it. Existing cases below still protect group-only operations.
+    it('opens, reads and answers a direct notification without invoking group planning', async () => {
+      const messageId = '50000000-0000-4000-8000-000000000009';
+      deps.decidePlan = vi.fn(async () => null);
+      const read = await service.getGroup(directId, { conversationKind: 'direct' });
+      expect(read).toMatchObject({ ok: true, group: { conversationKind: 'direct', canInvite: false, supportsGroupLeave: false } });
+      expect(await service.sendMessage({ groupId: directId, conversationKind: 'direct', text: 'Received',
+        clientId: 'direct-notice-reply', mentions: { all: false, botIds: [] } })).toMatchObject({ ok: true });
+      expect(writes()).toHaveLength(1);
+      expect(writes()[0]).toMatchObject([`/conversations/${directId}/messages`, 'POST', {
+        content: [{ type: 'text', text: 'Received' }], deferExecution: false,
+      }]);
+      expect(deps.decidePlan).not.toHaveBeenCalled();
+      expect(await service.getGroup(channelId, { conversationKind: 'direct' })).toMatchObject({ ok: false });
+      expect(await service.sendMessage({ groupId: directId, conversationKind: 'direct', text: 'No plan', division: true,
+        clientId: 'direct-notice-no-plan', mentions: { all: false, botIds: [] } })).toMatchObject({ ok: false });
+      expect(writes()).toHaveLength(1);
+      const previous = fixture.handle.getMockImplementation()!;
+      fixture.handle.mockImplementation((route, method, body) => route === `/conversations/${directId}/snapshot`
+        ? { body: { room: roomOf(directId), cursor: '2', members: [], reads: [{ thread_key: 'main', read_seq: '0' }],
+          messages: [{ id: messageId, seq: '2', threadRootId: null }] } }
+        : previous(route, method, body));
+      expect(await service.chatServer!.manage({ groupId: directId, action: { type: 'read', messageId, conversationKind: 'direct' } })).toMatchObject({ ok: true });
+      expect(writes().at(-1)).toMatchObject([`/conversations/${directId}/read`, 'POST', { readSeq: '2' }]);
+    });
+
     it('rejects a first send to a direct room before reading plans or members', async () => {
       expect(await service.sendMessage({ groupId: directId, text: 'hi', clientId: 'cold-direct-send', mentions: { all: true, botIds: [] } }))
         .toMatchObject({ ok: false, errorCode: 'NOT_FOUND' });
@@ -3706,6 +4200,7 @@ describe('Chat authentication recovery and polling backoff', () => {
     fixture.refresh.mockReset().mockResolvedValue(true);
     migration.read.mockReset().mockReturnValue(null);
     taskPosts.clear();
+    replyFiles.prepare.mockReset().mockImplementation(async text => ({ text, attachments: [] }));
     fixture.handle.mockReset().mockImplementation(healthy);
     service = withChatServer({ dispose: vi.fn(), listGroups: async () => ({ ok: true, groups: [] }) } as unknown as BotGroupChatService, {} as BotGroupChatServiceDeps);
   });
@@ -3716,6 +4211,7 @@ describe('Chat authentication recovery and polling backoff', () => {
     fixture.refresh.mockReset().mockResolvedValue(true);
     migration.read.mockReset().mockReturnValue(null);
     taskPosts.clear();
+    replyFiles.prepare.mockReset().mockImplementation(async text => ({ text, attachments: [] }));
     vi.useRealTimers();
   });
 

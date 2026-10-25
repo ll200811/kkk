@@ -86,6 +86,7 @@ import {
   saveBotSkillForSession,
 } from '../maker-ipc/botSkillService.js';
 import {
+  canBotContinueWorkbenchTask,
   captureBotCreatedTaskResponsibility,
   runBotWorkbenchTool,
   runBotProjectsTool,
@@ -309,6 +310,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
     isScopeCurrent: (db) => !isAppSessionBoundaryPending() && db === tryGetDbClient(),
     authorizeAction: createDesktopTaskActionAuthorizer({
       input: getTaskActionInputState, getSession: getTaskActionSession, confirm: confirmTaskAction,
+      isEntrustedTask: canBotContinueWorkbenchTask,
     }),
   });
   // Companion history uses the same account scope as ordinary task history.
@@ -1072,12 +1074,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
           if (request.type === 'manage' && input.permission?.planModeEnabled !== false)
             throw new Error('GROUP_AUTHORIZATION_REQUIRED');
         };
-        return executeCurrentGroupTool(sessionId, request, async summary => {
-          assertCurrent();
-          const confirmed = await confirmTaskAction(sessionId, 'manage_current_group', summary);
-          assertCurrent();
-          return confirmed;
-        }, assertCurrent);
+        return executeCurrentGroupTool(sessionId, request, assertCurrent);
       },
       // 伙伴的主力电脑:与界面同一条路径(本机交出 / 请主力电脑交出 / 在这台电脑继续)。
       teammateHome: {
@@ -1260,6 +1257,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       idleWorker: wrap((s, params) => s.idleWorker(params)),
       endTeam: wrap((s, params) => s.endTeam(params)),
       archiveWorker: wrap((s, params) => s.archiveWorker(params)),
+      updateWorker: wrap((s, params) => s.updateWorker(params)),
       listAvailableModels: wrap((s, params) => s.listAvailableModels(params)),
       getWorkspaceInfo: wrap((s, params) => s.getWorkspaceInfo(params)),
       getWorkerStatus: wrap((s, params) => s.getWorkerStatus(params)),

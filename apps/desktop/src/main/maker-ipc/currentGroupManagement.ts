@@ -8,7 +8,6 @@ interface Plan {
   steps: Array<{ position: number; botId: string; botName: string; task: string; status: string }>;
 }
 interface Room { id: string; kind?: string; name: string; topic: string; description: string; revision: number; archived: boolean; dissolved_at?: string | null }
-type Confirm = (summary: Record<string, unknown>) => Promise<boolean>;
 interface Dependencies {
   botActorId: string; requesterId?: string;
   execution: { id: string; source_message_id: string; plan_id?: string | null; plan_step?: number | null };
@@ -19,7 +18,6 @@ interface Dependencies {
   api<T>(route: string, method?: string, data?: unknown, actorId?: string): Promise<T>;
   changed(): void;
   inviteToken(link: string): string;
-  supportsDissolve(): boolean;
   ownedBots(): Promise<Array<{ actorId: string; botId: string; name: string }>>;
   executionStopped(executionId: string): Promise<void>;
   reconcileExecutions(): Promise<void>;
@@ -41,7 +39,7 @@ export function createCurrentGroupManagement(deps: Dependencies) {
     if (!bot || !requester || snapshot.room.kind !== 'group') throw new Error('GROUP_AUTHORIZATION_REQUIRED');
     return { ...snapshot, bot, requester };
   }
-  async function execute(request: CurrentGroupRequest, confirm: Confirm, assertPermission: () => void): Promise<CurrentGroupResult> {
+  async function execute(request: CurrentGroupRequest, assertPermission: () => void): Promise<CurrentGroupResult> {
     try {
       let ctx = await context();
       assertPermission();
@@ -64,8 +62,7 @@ export function createCurrentGroupManagement(deps: Dependencies) {
         const active = !ctx.room.archived && !ctx.room.dissolved_at;
         const result: CurrentGroupResult = { ok: true, group: { id: ctx.room.id, name: ctx.room.name, topic: ctx.room.topic, description: ctx.room.description, revision: ctx.room.revision, archived: ctx.room.archived, dissolvedAt: ctx.room.dissolved_at ?? null },
           self: { actorId: ctx.bot.id, role: ctx.bot.role }, requester: { actorId: ctx.requester.id, role: ctx.requester.role, directsOwnBot: ownerProxy() },
-          permissions: { update: active && bothManage(), members: active && bothManage(), memberRoles: active && bothOwn(), invitations: active && bothManage(), archive: !ctx.room.dissolved_at && bothManage(), queue: active && bothManage(), transfer: active && bothOwn(), dissolve: active && bothOwn() && deps.supportsDissolve() },
-          requiresConfirmation: ['transfer', 'dissolve'],
+          permissions: { update: active && bothManage(), members: active && bothManage(), memberRoles: active && bothOwn(), invitations: active && bothManage(), archive: !ctx.room.dissolved_at && bothManage(), queue: active && bothManage() },
           protectedActorIds: ctx.members.filter(m => (m.role === 'owner' && m.state === 'joined') || m.id === ctx.bot.id || m.id === ctx.requester.id).map(m => m.id),
           members: ctx.members.map(m => ({ actorId: m.id, kind: m.kind, name: m.name, role: m.role, state: m.state, ownerActorId: m.ownerActorId, ownerName: m.ownerName })),
           invitableBots: active && bothManage() ? ownedBots.filter(b => !ctx.members.some(m => m.id === b.actorId && m.state === 'joined')) : [],
@@ -87,28 +84,23 @@ export function createCurrentGroupManagement(deps: Dependencies) {
       const checkAuthorization = () => {
         if (!ownerProxy()) throw new Error('GROUP_REQUESTER_AUTHORIZATION_UNSUPPORTED');
         if (!bothManage()) throw new Error('GROUP_ROLE_REQUIRED');
-        if ((['transfer', 'dissolve'].includes(action.type) || (action.type === 'member' && action.action === 'role')) && !bothOwn()) throw new Error('GROUP_OWNER_REQUIRED');
+        if ((action.type === 'member' && action.action === 'role') && !bothOwn()) throw new Error('GROUP_OWNER_REQUIRED');
         deps.assertCurrent(); assertPermission();
       };
       const check = () => {
         checkAuthorization();
         if (ctx.room.dissolved_at || (ctx.room.archived && action.type !== 'archive')) throw new Error('GROUP_CLOSED');
-        if (action.type === 'dissolve' && !deps.supportsDissolve()) throw new Error('LIFECYCLE_UNAVAILABLE');
         if (action.type === 'update' && Object.keys(action).length <= 2) throw new Error('INVALID_ACTION');
         if (action.type === 'plan' && ['remove', 'reassign'].includes(action.action)) {
           if (action.position === undefined) throw new Error('INVALID_ACTION');
           if (action.action === 'reassign' && !ctx.members.some(m => m.id === action.botId && m.kind === 'bot' && m.state === 'joined')) throw new Error('INVALID_MEMBER');
         }
         if (!replay && 'expectedRevision' in action && action.type !== 'plan' && action.expectedRevision !== ctx.room.revision) throw new Error('REVISION_CONFLICT');
-        if (action.type === 'member' || action.type === 'transfer') {
+        if (action.type === 'member') {
           const target = ctx.members.find(m => m.id === action.actorId);
-          if (action.type === 'transfer') {
-            if (!target || target.state !== 'joined' || target.id === ctx.bot.id) throw new Error('INVALID_MEMBER');
-          } else {
-            if (action.action === 'role' && (!action.role || !bothOwn())) throw new Error('GROUP_OWNER_REQUIRED');
-            if (action.action !== 'invite' && !target) throw new Error('INVALID_MEMBER');
-            if (target?.id === ctx.bot.id || target?.id === ctx.requester.id || (target?.role === 'owner' && target.state === 'joined')) throw new Error('MEMBER_PROTECTED');
-          }
+          if (action.action === 'role' && (!action.role || !bothOwn())) throw new Error('GROUP_OWNER_REQUIRED');
+          if (action.action !== 'invite' && !target) throw new Error('INVALID_MEMBER');
+          if (target?.id === ctx.bot.id || target?.id === ctx.requester.id || (target?.role === 'owner' && target.state === 'joined')) throw new Error('MEMBER_PROTECTED');
         }
         deps.assertCurrent(); assertPermission();
       };
@@ -117,18 +109,12 @@ export function createCurrentGroupManagement(deps: Dependencies) {
       if (unknownResult) throw new Error('GROUP_RESULT_UNKNOWN');
       if (previous?.result.ok) return previous.result;
       check();
-      if (action.type === 'transfer' || action.type === 'dissolve') {
-        if (!(await confirm({ groupId: ctx.room.id, groupName: ctx.room.name, actingBot: ctx.bot.id, requesterId: ctx.requester.id, operationId, action }))) throw new Error('USER_CANCELLED');
-        ctx = await context(); check();
-      }
       let route = roomPath; let method = 'POST'; let payload: Record<string, unknown>;
       if (replay) ({ route, method, payload } = replay);
       else switch (action.type) {
         case 'update': { const { type: _, ...fields } = action; method = 'PATCH'; payload = fields; break; }
         case 'archive': method = 'PATCH'; payload = { archived: action.archived, expectedRevision: action.expectedRevision }; break;
         case 'member': { const { type: _, ...fields } = action; route += '/members'; payload = fields; break; }
-        case 'transfer': route += '/transfer'; payload = { actorId: action.actorId }; break;
-        case 'dissolve': route += '/dissolve'; payload = { expectedRevision: action.expectedRevision }; break;
         case 'createInvite': route += '/invite-links'; payload = {}; break;
         case 'revokeInvite': {
           route += '/invite-links/revoke'; payload = { token: deps.inviteToken(action.link) }; break;
@@ -146,7 +132,7 @@ export function createCurrentGroupManagement(deps: Dependencies) {
           payload = { ...fields, action: action.action === 'dismiss' && plan.status === 'waiting' ? 'stop' : action.action }; break;
         }
       }
-      // Reads and confirmation may have waited. Recheck after them, immediately before HTTP.
+      // Reads may have waited. Recheck after them, immediately before HTTP.
       ctx = await context(); check();
       try {
         const response = await deps.api<Record<string, unknown>>(route, method, { operationId, ...payload }, deps.botActorId);
@@ -158,7 +144,6 @@ export function createCurrentGroupManagement(deps: Dependencies) {
           receipt = { link: `cindy://chat-invite/${invite.token}`, expiresAt: invite.expiresAt, ...(invite.reusable !== undefined ? { reusable: invite.reusable } : {}) };
         }
         if (action.type === 'revokeInvite') z.object({ revoked: z.literal(true) }).parse(response);
-        if (action.type === 'dissolve') z.object({ revision: z.number().int().positive(), dissolvedAt: z.string().refine(value => Number.isFinite(Date.parse(value))), dissolvedBy: z.string().uuid() }).parse(response);
         const result: CurrentGroupResult = { ok: true, operationId, action: action.type, receipt };
         attempts.set(operationId, { fingerprint, result });
         if (action.type === 'execution') await deps.executionStopped(action.executionId);
@@ -182,8 +167,8 @@ export function createCurrentGroupManagement(deps: Dependencies) {
       return { ok: false, errorCode, message: errorCode === 'GROUP_RESULT_UNKNOWN' ? 'Read get_current_group before deciding whether to retry.' : `Group operation refused (${errorCode}). Query current group state and permissions.` };
     }
   }
-  return (request: CurrentGroupRequest, confirm: Confirm, assertPermission: () => void = () => {}) => {
-    const pending = tail.then(() => execute(request, confirm, assertPermission));
+  return (request: CurrentGroupRequest, assertPermission: () => void = () => {}) => {
+    const pending = tail.then(() => execute(request, assertPermission));
     tail = pending.catch(() => undefined);
     return pending;
   };

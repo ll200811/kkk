@@ -20,7 +20,7 @@ function parsePayload(result: unknown): Record<string, unknown> {
 describe("cindy_helper MCP server", () => {
   // #6906, unit: MCP discovery/direct/progressive routes must reach the bound Host callback.
   // Existing tests have no group-management tools; minimum failing input is list_tools(bots).
-  // Standalone file: 1.52s wall, 139ms test execution.
+  // Standalone file: 1.30s wall, 129ms test execution.
   it.each(['claude-code', 'codex', 'pi'] as const)('discovers and routes current-group management for %s', async agentKind => {
     const currentGroup = vi.fn(async (sessionId: string) => ({ ok: true as const, boundSession: sessionId }));
     const server = createXdtHelperMcpServer({ resolveSurface: async () => 'bot', currentGroup }, {
@@ -48,6 +48,19 @@ describe("cindy_helper MCP server", () => {
       const count = currentGroup.mock.calls.length;
       const invalid = await client.callTool({ name: 'call_tool', arguments: { name: 'manage_current_group', args: { ...mutation, action: { type: 'botAccess', actorId: '70000000-0000-4000-8000-000000000002', access: 'tools' } } } });
       expect(invalid.isError).toBe(true); expect(currentGroup).toHaveBeenCalledTimes(count);
+      // #6944: reject legacy lifecycle actions through every available call form,
+      // including the progressive route used by Pi, before reaching the Host.
+      for (const action of [{ type: 'transfer', actorId: restore.groupId }, { type: 'dissolve', expectedRevision: 1 },
+        { type: 'member', actorId: restore.groupId, action: 'role', role: 'owner' }]) {
+        for (const direct of agentKind === 'pi' ? [false] : [false, true]) {
+          const args = { ...mutation, action };
+          const rejected = await client.callTool({ name: direct ? 'manage_current_group' : 'call_tool',
+            arguments: direct ? args : { name: 'manage_current_group', args } });
+          expect(rejected.isError).toBe(true);
+          expect(currentGroup).toHaveBeenCalledTimes(count);
+        }
+      }
+
     } finally { await client.close(); await server.close(); }
   });
 
